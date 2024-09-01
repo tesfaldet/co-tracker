@@ -58,7 +58,8 @@ class EvaluationPredictor(torch.nn.Module):
 
                 traj_e_pind, vis_e_pind = self._process_one_point(video, query)
                 traj_e[:, t:, pind : pind + 1] = traj_e_pind[:, :, :1]
-                vis_e[:, t:, pind : pind + 1] = vis_e_pind[:, :, :1]
+                if vis_e_pind is not None:
+                    vis_e[:, t:, pind : pind + 1] = vis_e_pind[:, :, :1]
         else:
             if self.grid_size > 0:
                 xy = get_points_on_a_grid(self.grid_size, video.shape[3:])

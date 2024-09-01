@@ -36,6 +36,9 @@ from cotracker.datasets.utils import collate_fn, collate_fn_train, dataclass_to_
 from cotracker.models.core.cotracker.losses import sequence_loss, balanced_ce_loss
 
 
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+
+
 # define the handler function
 # for training on a slurm cluster
 def sig_handler(signum, frame):
@@ -265,7 +268,8 @@ class Lite(LightningLite):
                 eval_dataloaders.append(("dynamic_replica", eval_dataloader_dr))
 
             if "tapvid_davis_first" in args.eval_datasets:
-                data_root = os.path.join(args.dataset_root, "tapvid/tapvid_davis/tapvid_davis.pkl")
+                # data_root = os.path.join(args.dataset_root, "tapvid/tapvid_davis/tapvid_davis.pkl")
+                data_root = "/home/mila/m/mattie.tesfaldet/scratch/Projects/diffusion-pips/datasets/tapvid_davis/tapvid_davis.pkl"
                 eval_dataset = TapVidDataset(dataset_type="davis", data_root=data_root)
                 eval_dataloader_tapvid_davis = torch.utils.data.DataLoader(
                     eval_dataset,
@@ -303,7 +307,8 @@ class Lite(LightningLite):
         model.cuda()
 
         train_dataset = kubric_movif_dataset.KubricMovifDataset(
-            data_root=os.path.join(args.dataset_root, "kubric", "kubric_movi_f_tracks"),
+            # data_root=os.path.join(args.dataset_root, "kubric", "kubric_movi_f_tracks"),
+            data_root="/home/mila/m/mattie.tesfaldet/scratch/Projects/diffusion-pips/datasets/kubric_movi_f",
             crop_size=args.crop_size,
             seq_len=args.sequence_len,
             traj_per_sample=args.traj_per_sample,
@@ -368,6 +373,14 @@ class Lite(LightningLite):
             model.load_state_dict(state_dict, strict=strict)
 
             logging.info(f"Done loading checkpoint")
+
+        print(f"fnet param count (trainable): {sum(p.numel() for p in model.fnet.parameters() if p.requires_grad)}")
+        print(f"fnet param count (total): {sum(p.numel() for p in model.fnet.parameters())}")
+        print(f"updateformer param count (trainable): {sum(p.numel() for p in model.updateformer.parameters() if p.requires_grad)}")
+        print(f"updateformer param count (total): {sum(p.numel() for p in model.updateformer.parameters())}")
+        print(f"CoTracker param count (trainable): {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+        print(f"CoTracker param count (total): {sum(p.numel() for p in model.parameters())}")
+
         model, optimizer = self.setup(model, optimizer, move_to_device=False)
         # model.cuda()
         model.train()
@@ -490,7 +503,7 @@ class Lite(LightningLite):
 
 if __name__ == "__main__":
     signal.signal(signal.SIGUSR1, sig_handler)
-    signal.signal(signal.SIGTERM, term_handler)
+    signal.signal(signal.SIGTERM, sig_handler)
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", default="cotracker", help="model name")
     parser.add_argument("--restore_ckpt", help="path to restore a checkpoint")

@@ -8,6 +8,7 @@ import os
 import torch
 import cv2
 
+from pathlib import Path
 import imageio
 import numpy as np
 
@@ -357,29 +358,30 @@ class KubricMovifDataset(CoTrackerDataset):
         self.resize_lim = [0.75, 1.25]  # sample resizes from here
         self.resize_delta = 0.05
         self.max_crop_offset = 15
-        self.seq_names = [
-            fname
-            for fname in os.listdir(data_root)
-            if os.path.isdir(os.path.join(data_root, fname))
-        ]
-        print("found %d unique videos in %s" % (len(self.seq_names), self.data_root))
+
+        sequence_paths = sorted([seq_path for seq_path in Path(self.data_root).iterdir() if seq_path.is_dir()])
+        self.full_sequences = {
+            seq.name: {
+                "annot_path": str(seq / f"{seq.name}.npy"),
+            }
+            for seq in sequence_paths
+        }
+        self.sequence_names = sorted(list(self.full_sequences.keys()))
+
+        print(f"Found {len(self)} videos in {self.data_root}.")
 
     def getitem_helper(self, index):
         gotit = True
-        seq_name = self.seq_names[index]
+        seq_name = self.sequence_names[index]
+        sequence = self.full_sequences[seq_name]
+        data = np.load(sequence["annot_path"], allow_pickle=True).item()
+        rgbs = data["video"]  # [S, H, W, C] uint8 NDArray containing the video frames.
+        traj_2d = data["points"]  # [N, S, 2] NDArray containing ground truth trajectories.
+        visibility = ~data["occluded"]  # [N, S] NDArray containing occlusion status of each target point.
 
-        npy_path = os.path.join(self.data_root, seq_name, seq_name + ".npy")
-        rgb_path = os.path.join(self.data_root, seq_name, "frames")
-
-        img_paths = sorted(os.listdir(rgb_path))
-        rgbs = []
-        for i, img_path in enumerate(img_paths):
-            rgbs.append(imageio.v2.imread(os.path.join(rgb_path, img_path)))
-
-        rgbs = np.stack(rgbs)
-        annot_dict = np.load(npy_path, allow_pickle=True).item()
-        traj_2d = annot_dict["coords"]
-        visibility = annot_dict["visibility"]
+        rgbs = [rgb for rgb in rgbs]  # List of [H, W, C] uint8 NDArrays.
+        traj_2d = traj_2d.transpose(1, 0, 2)  # [S, N, 2]
+        visibility = visibility.transpose(1, 0)  # [S, N]
 
         # random crop
         assert self.seq_len <= len(rgbs)
@@ -387,11 +389,9 @@ class KubricMovifDataset(CoTrackerDataset):
             start_ind = np.random.choice(len(rgbs) - self.seq_len, 1)[0]
 
             rgbs = rgbs[start_ind : start_ind + self.seq_len]
-            traj_2d = traj_2d[:, start_ind : start_ind + self.seq_len]
-            visibility = visibility[:, start_ind : start_ind + self.seq_len]
+            traj_2d = traj_2d[start_ind : start_ind + self.seq_len]
+            visibility = visibility[start_ind : start_ind + self.seq_len]
 
-        traj_2d = np.transpose(traj_2d, (1, 0, 2))
-        visibility = np.transpose(np.logical_not(visibility), (1, 0))
         if self.use_augs:
             rgbs, traj_2d, visibility = self.add_photometric_augs(rgbs, traj_2d, visibility)
             rgbs, traj_2d = self.add_spatial_augs(rgbs, traj_2d, visibility)
@@ -438,4 +438,4 @@ class KubricMovifDataset(CoTrackerDataset):
         return sample, gotit
 
     def __len__(self):
-        return len(self.seq_names)
+        return len(self.full_sequences)

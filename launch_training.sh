@@ -1,10 +1,8 @@
 #!/bin/bash
 
-EXP_DIR=$1
-EXP_NAME=$2
-DATE=$3
-DATASET_ROOT=$4
-NUM_STEPS=$5
+EXP_DIR="./experiments"
+EXP_NAME=$1
+DATE=`(date +'%Y-%m-%d_%H-%M-%S')`
 
 
 echo `which python`
@@ -12,13 +10,14 @@ echo `which python`
 mkdir -p ${EXP_DIR}/${DATE}_${EXP_NAME}/logs/;
 
 export PYTHONPATH=`(cd ../ && pwd)`:`pwd`:$PYTHONPATH
-sbatch --comment=${EXP_NAME} --partition=learn --time=39:00:00 --gpus-per-node=8 --nodes=4 --ntasks-per-node=8 \
---job-name=${EXP_NAME} --cpus-per-task=10 --signal=USR1@60 --open-mode=append \
+sbatch --comment=${EXP_NAME} --partition=long --time=2-00:00:00 --gres=gpu:rtx8000:4 --nodes=1 --ntasks-per-node=4 \
+--job-name=${EXP_NAME} --cpus-per-task=6 --signal=USR1@120 --open-mode=append --mem-per-gpu=18GB \
 --output=${EXP_DIR}/${DATE}_${EXP_NAME}/logs/%j_%x_%A_%a_%N.out \
 --error=${EXP_DIR}/${DATE}_${EXP_NAME}/logs/%j_%x_%A_%a_%N.err \
---wrap="srun --label python ./train.py --batch_size 1 \
---num_steps ${NUM_STEPS} --ckpt_path ${EXP_DIR}/${DATE}_${EXP_NAME} --model_name cotracker \
---save_freq 200 --sequence_len 24 --eval_datasets dynamic_replica tapvid_davis_first \
---traj_per_sample 768 --sliding_window_len 8 \
---save_every_n_epoch 10 --evaluate_every_n_epoch 10 --model_stride 4 --dataset_root ${DATASET_ROOT} --num_nodes 4 \
+--wrap="module load miniconda/3; conda activate /home/mila/m/mattie.tesfaldet/miniconda3/envs/cotracker; \
+srun --label python ./train.py --batch_size 2 \
+--num_steps 200000 --ckpt_path ${EXP_DIR}/${DATE}_${EXP_NAME} --model_name cotracker \
+--save_freq 200 --sequence_len 24 --eval_datasets tapvid_davis_first \
+--traj_per_sample 128 --sliding_window_len 16 \
+--save_every_n_epoch 1 --evaluate_every_n_epoch 10 --model_stride 4 --num_nodes 1 \
 --num_virtual_tracks 64"

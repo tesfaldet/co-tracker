@@ -7,6 +7,7 @@
 import torch
 
 from cotracker.models.core.cotracker.cotracker import CoTracker2
+from cotracker.models.core.ndtracker import NDTracker
 
 
 def build_cotracker(

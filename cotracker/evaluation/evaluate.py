@@ -25,6 +25,9 @@ from cotracker.models.build_cotracker import (
     build_cotracker,
 )
 
+from cotracker.models.core.ndtracker import NDTracker
+
+# python ./cotracker/evaluation/evaluate.py --config-name eval_tapvid_davis_first exp_dir=./eval_outputs dataset_root=your/tapvid/path hydra.mode=RunMode.RUN
 
 @dataclass(eq=False)
 class DefaultConfig:
@@ -38,16 +41,19 @@ class DefaultConfig:
 
     # Path to the pre-trained model checkpoint to be used for the evaluation.
     # The default value is the path to a specific CoTracker model checkpoint.
-    checkpoint: str = "./checkpoints/cotracker2.pth"
+    checkpoint: str = "/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/cotracker2.pth"
 
     # EvaluationPredictor parameters
     # The size (N) of the support grid used in the predictor.
     # The total number of points is (N*N).
-    grid_size: int = 5
+    # grid_size: int = 5
+    grid_size: int = 0
     # The size (N) of the local support grid.
-    local_grid_size: int = 8
+    # local_grid_size: int = 8
+    local_grid_size: int = 0
     # A flag indicating whether to evaluate one ground truth point at a time.
-    single_point: bool = True
+    # single_point: bool = True
+    single_point: bool = False
     # The number of iterative updates for each sliding window.
     n_iters: int = 6
 
@@ -88,7 +94,24 @@ def run_eval(cfg: DefaultConfig):
         OmegaConf.save(config=cfg, f=f)
 
     evaluator = Evaluator(cfg.exp_dir)
-    cotracker_model = build_cotracker(cfg.checkpoint)
+    # cotracker_model = build_cotracker(cfg.checkpoint)
+
+    cotracker_model = NDTracker(
+        encoder_stride=4,
+        encoder_dim=128,
+        encoder_ckpt=None,
+        finetune_encoder=False,
+        transformer_token_dim=256,
+        transformer_num_heads=8,
+        transformer_mlp_hidden_dim_mult=2,
+        transformer_depth=6,
+    )
+    weights = torch.load("/home/mila/m/mattie.tesfaldet/Projects/diffusion-pips/data/checkpoints/ndtracker_state_dict.ckpt", weights_only=True)
+    weights = {
+        k.removeprefix("tracker."): v for k, v in weights.items() if k.startswith("tracker.")
+    }
+    cotracker_model.load_state_dict(weights)
+    cotracker_model.eval()
 
     # Creating the EvaluationPredictor object
     predictor = EvaluationPredictor(
@@ -110,7 +133,8 @@ def run_eval(cfg: DefaultConfig):
     if "tapvid" in cfg.dataset_name:
         dataset_type = cfg.dataset_name.split("_")[1]
         if dataset_type == "davis":
-            data_root = os.path.join(cfg.dataset_root, "tapvid_davis", "tapvid_davis.pkl")
+            # data_root = os.path.join(cfg.dataset_root, "tapvid_davis", "tapvid_davis.pkl")
+            data_root = "/home/mila/m/mattie.tesfaldet/scratch/Projects/diffusion-pips/datasets/tapvid_davis/tapvid_davis.pkl"
         elif dataset_type == "kinetics":
             data_root = os.path.join(
                 cfg.dataset_root, "/kinetics/kinetics-dataset/k700-2020/tapvid_kinetics"

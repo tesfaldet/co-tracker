@@ -179,7 +179,9 @@ class TapVidDataset(torch.utils.data.Dataset):
         target_points = self.points_dataset[video_name]["points"]
         if self.resize_to_256:
             frames = resize_video(frames, [256, 256])
+            # frames = resize_video(frames, [384, 512])
             target_points *= np.array([255, 255])  # 1 should be mapped to 256-1
+            # target_points *= np.array([frames.shape[2] - 1, frames.shape[1] - 1])
         else:
             target_points *= np.array([frames.shape[2] - 1, frames.shape[1] - 1])
 

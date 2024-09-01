@@ -1,0 +1,19 @@
+name: cotracker
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - pytorch-lightning==1.6.0
+  - tensorboard
+  - torchvision
+  - matplotlib
+  - imageio[ffmpeg]
+  - mediapy
+  - tqdm
+  - hydra-core=1.3
+  - pip
+  - pip:
+    - opencv-python
+    - flow-vis
