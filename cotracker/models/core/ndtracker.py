@@ -343,6 +343,13 @@ class NDTracker(nn.Module):
         num_windows = (T - self.window_size + sliding_window_step_size - 1) // sliding_window_step_size + 1
         frame_overlap = self.window_size - sliding_window_step_size
 
+        pad = (self.window_size - T % self.window_size) % self.window_size
+        video = F.pad(video.reshape(B, 1, T, C * H * W), (0, 0, 0, pad), "replicate").reshape(
+            B, -1, C, H, W
+        )
+        T_trimmed = T
+        B, T, C, H, W = video.shape
+
         # Queries will be the coordinates at the first frame of the current window.
         queried_coords = queries[..., 1:]
         queried_frames = queries[..., :1]
@@ -363,7 +370,7 @@ class NDTracker(nn.Module):
                 end_frame = end_frame - diff
                 cur_frame = max(cur_frame - diff, 0)
 
-            # print(f"Processing frames {cur_frame}:{end_frame - 1} / {T - 1}.")
+            print(f"Processing frames {cur_frame}:{end_frame - 1} / {T - 1}.")
 
             # Sample trajectories for validation losses.
             trajs_pred, query_feats, corrs_pyramid = self._forward(
@@ -381,6 +388,7 @@ class NDTracker(nn.Module):
 
             if end_frame >= T:
                 done = True
+                trajs_pred_all = trajs_pred_all[:, :T_trimmed]
             else:
                 cur_frame = cur_frame + self.window_size - frame_overlap
 
@@ -525,6 +533,8 @@ class NDTracker(nn.Module):
 
         queried_coords = queries[..., :2]  # B N 2
         queried_frames = queries[..., 2:]  # B N 1
+
+        assert torch.all(queried_frames == 0)
 
         # We rescale the coordinates to the feature map space since it's downscaled.
         queried_coords = queried_coords / self.encoder_stride

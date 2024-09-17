@@ -41,7 +41,7 @@ class DefaultConfig:
 
     # Path to the pre-trained model checkpoint to be used for the evaluation.
     # The default value is the path to a specific CoTracker model checkpoint.
-    checkpoint: str = "/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/cotracker2.pth"
+    checkpoint: str = "/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/cotracker_final.pth"
 
     # EvaluationPredictor parameters
     # The size (N) of the support grid used in the predictor.
@@ -106,7 +106,7 @@ def run_eval(cfg: DefaultConfig):
         transformer_mlp_hidden_dim_mult=2,
         transformer_depth=6,
     )
-    weights = torch.load("/home/mila/m/mattie.tesfaldet/Projects/diffusion-pips/data/checkpoints/ndtracker_state_dict.ckpt", weights_only=True)
+    weights = torch.load("/home/mila/m/mattie.tesfaldet/Projects/diffusion-pips/data/checkpoints/ndtracker_final.ckpt", map_location="cpu", weights_only=True)
     weights = {
         k.removeprefix("tracker."): v for k, v in weights.items() if k.startswith("tracker.")
     }

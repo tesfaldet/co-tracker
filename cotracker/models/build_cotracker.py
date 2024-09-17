@@ -23,7 +23,7 @@ def build_cotracker(
 
 
 def build_cotracker(checkpoint=None):
-    cotracker = CoTracker2(stride=4, window_len=8, add_space_attn=True)
+    cotracker = CoTracker2(stride=4, window_len=16, add_space_attn=True)
 
     if checkpoint is not None:
         with open(checkpoint, "rb") as f:

@@ -40,122 +40,122 @@ class Evaluator:
         if "tapvid" in dataset_name:
             B, T, N, D = sample.trajectory.shape
 
-            traj = sample.trajectory.clone()
-            thr = 0.9
+            # traj = sample.trajectory.clone()
+            # thr = 0.9
 
-            if pred_visibility is None:
-                logging.warning("visibility is NONE")
-                pred_visibility = torch.zeros_like(sample.visibility)
+            # if pred_visibility is None:
+            #     logging.warning("visibility is NONE")
+            #     pred_visibility = torch.zeros_like(sample.visibility)
 
-            if not pred_visibility.dtype == torch.bool:
-                pred_visibility = pred_visibility > thr
+            # if not pred_visibility.dtype == torch.bool:
+            #     pred_visibility = pred_visibility > thr
 
-            query_points = sample.query_points.clone().cpu().numpy()
+            # query_points = sample.query_points.clone().cpu().numpy()
 
-            pred_visibility = pred_visibility[:, :, :N]
-            pred_trajectory = pred_trajectory[:, :, :N]
+            # pred_visibility = pred_visibility[:, :, :N]
+            # pred_trajectory = pred_trajectory[:, :, :N]
 
-            gt_tracks = traj.permute(0, 2, 1, 3).cpu().numpy()
-            gt_occluded = (
-                torch.logical_not(sample.visibility.clone().permute(0, 2, 1)).cpu().numpy()
-            )
+            # gt_tracks = traj.permute(0, 2, 1, 3).cpu().numpy()
+            # gt_occluded = (
+            #     torch.logical_not(sample.visibility.clone().permute(0, 2, 1)).cpu().numpy()
+            # )
 
-            pred_occluded = (
-                torch.logical_not(pred_visibility.clone().permute(0, 2, 1)).cpu().numpy()
-            )
-            pred_tracks = pred_trajectory.permute(0, 2, 1, 3).cpu().numpy()
+            # pred_occluded = (
+            #     torch.logical_not(pred_visibility.clone().permute(0, 2, 1)).cpu().numpy()
+            # )
+            # pred_tracks = pred_trajectory.permute(0, 2, 1, 3).cpu().numpy()
 
-            out_metrics = compute_tapvid_metrics(
-                query_points,
-                gt_occluded,
-                gt_tracks,
-                pred_occluded,
-                pred_tracks,
-                query_mode="strided" if "strided" in dataset_name else "first",
-            )
-
-            metrics[sample.seq_name[0]] = out_metrics
-            for metric_name in out_metrics.keys():
-                if "avg" not in metrics:
-                    metrics["avg"] = {}
-                metrics["avg"][metric_name] = np.mean(
-                    [v[metric_name] for k, v in metrics.items() if k != "avg"]
-                )
-
-            logging.info(f"Metrics: {out_metrics}")
-            logging.info(f"avg: {metrics['avg']}")
-            print("metrics", out_metrics)
-            print("avg", metrics["avg"])
-
-            # UNCOMMENT
-            # H, W = sample.video.shape[-2:]
-            # device = sample.video.device
-            # out_metrics = {}
-            # d_vis_sum = d_occ_sum = d_sum_all = 0.0
-            # thrs = [1, 2, 4, 8, 16]
-            # sx_ = (W - 1) / 255.0
-            # sy_ = (H - 1) / 255.0
-            # sc_py = np.array([sx_, sy_]).reshape([1, 1, 2])
-            # sc_pt = torch.from_numpy(sc_py).float().to(device)
-            # __, first_visible_inds = torch.max(sample.visibility, dim=1)
-
-            # frame_ids_tensor = torch.arange(T, device=device)[None, :, None].repeat(B, 1, N)
-            # start_tracking_mask = frame_ids_tensor > (first_visible_inds.unsqueeze(1))
-
-            # for thr in thrs:
-            #     d_ = (
-            #         torch.norm(
-            #             pred_trajectory[..., :2] / sc_pt - sample.trajectory[..., :2] / sc_pt,
-            #             dim=-1,
-            #         )
-            #         < thr
-            #     ).float()  # B,S-1,N
-            #     d_occ = (
-            #         reduce_masked_mean(d_, (1 - sample.visibility) * start_tracking_mask).item()
-            #         * 100.0
-            #     )
-            #     d_occ_sum += d_occ
-            #     out_metrics[f"accuracy_occ_{thr}"] = d_occ
-
-            #     d_vis = (
-            #         reduce_masked_mean(d_, sample.visibility * start_tracking_mask).item() * 100.0
-            #     )
-            #     d_vis_sum += d_vis
-            #     out_metrics[f"accuracy_vis_{thr}"] = d_vis
-
-            #     d_all = reduce_masked_mean(d_, start_tracking_mask).item() * 100.0
-            #     d_sum_all += d_all
-            #     out_metrics[f"accuracy_{thr}"] = d_all
-
-            # d_occ_avg = d_occ_sum / len(thrs)
-            # d_vis_avg = d_vis_sum / len(thrs)
-            # d_all_avg = d_sum_all / len(thrs)
-
-            # sur_thr = 16
-            # dists = torch.norm(
-            #     pred_trajectory[..., :2] / sc_pt - sample.trajectory[..., :2] / sc_pt,
-            #     dim=-1,
-            # )  # B,S,N
-            # dist_ok = 1 - (dists > sur_thr).float() * sample.visibility  # B,S,N
-            # survival = torch.cumprod(dist_ok, dim=1)  # B,S,N
-            # out_metrics["survival"] = torch.mean(survival).item() * 100.0
-
-            # out_metrics["accuracy_occ"] = d_occ_avg
-            # out_metrics["accuracy_vis"] = d_vis_avg
-            # out_metrics["accuracy"] = d_all_avg
+            # out_metrics = compute_tapvid_metrics(
+            #     query_points,
+            #     gt_occluded,
+            #     gt_tracks,
+            #     pred_occluded,
+            #     pred_tracks,
+            #     query_mode="strided" if "strided" in dataset_name else "first",
+            # )
 
             # metrics[sample.seq_name[0]] = out_metrics
             # for metric_name in out_metrics.keys():
             #     if "avg" not in metrics:
             #         metrics["avg"] = {}
-            #     metrics["avg"][metric_name] = float(
-            #         np.mean([v[metric_name] for k, v in metrics.items() if k != "avg"])
+            #     metrics["avg"][metric_name] = np.mean(
+            #         [v[metric_name] for k, v in metrics.items() if k != "avg"]
             #     )
 
             # logging.info(f"Metrics: {out_metrics}")
             # logging.info(f"avg: {metrics['avg']}")
             # print("metrics", out_metrics)
             # print("avg", metrics["avg"])
+
+            # UNCOMMENT
+            H, W = sample.video.shape[-2:]
+            device = sample.video.device
+            out_metrics = {}
+            d_vis_sum = d_occ_sum = d_sum_all = 0.0
+            thrs = [1, 2, 4, 8, 16]
+            sx_ = (W - 1) / 255.0
+            sy_ = (H - 1) / 255.0
+            sc_py = np.array([sx_, sy_]).reshape([1, 1, 2])
+            sc_pt = torch.from_numpy(sc_py).float().to(device)
+            __, first_visible_inds = torch.max(sample.visibility, dim=1)
+
+            frame_ids_tensor = torch.arange(T, device=device)[None, :, None].repeat(B, 1, N)
+            start_tracking_mask = frame_ids_tensor > (first_visible_inds.unsqueeze(1))
+
+            for thr in thrs:
+                d_ = (
+                    torch.norm(
+                        pred_trajectory[..., :2] / sc_pt - sample.trajectory[..., :2] / sc_pt,
+                        dim=-1,
+                    )
+                    < thr
+                ).float()  # B,S-1,N
+                d_occ = (
+                    reduce_masked_mean(d_, (1 - sample.visibility) * start_tracking_mask).item()
+                    * 100.0
+                )
+                d_occ_sum += d_occ
+                out_metrics[f"accuracy_occ_{thr}"] = d_occ
+
+                d_vis = (
+                    reduce_masked_mean(d_, sample.visibility * start_tracking_mask).item() * 100.0
+                )
+                d_vis_sum += d_vis
+                out_metrics[f"accuracy_vis_{thr}"] = d_vis
+
+                d_all = reduce_masked_mean(d_, start_tracking_mask).item() * 100.0
+                d_sum_all += d_all
+                out_metrics[f"accuracy_{thr}"] = d_all
+
+            d_occ_avg = d_occ_sum / len(thrs)
+            d_vis_avg = d_vis_sum / len(thrs)
+            d_all_avg = d_sum_all / len(thrs)
+
+            sur_thr = 16
+            dists = torch.norm(
+                pred_trajectory[..., :2] / sc_pt - sample.trajectory[..., :2] / sc_pt,
+                dim=-1,
+            )  # B,S,N
+            dist_ok = 1 - (dists > sur_thr).float() * sample.visibility  # B,S,N
+            survival = torch.cumprod(dist_ok, dim=1)  # B,S,N
+            out_metrics["survival"] = torch.mean(survival).item() * 100.0
+
+            out_metrics["accuracy_occ"] = d_occ_avg
+            out_metrics["accuracy_vis"] = d_vis_avg
+            out_metrics["accuracy"] = d_all_avg
+
+            metrics[sample.seq_name[0]] = out_metrics
+            for metric_name in out_metrics.keys():
+                if "avg" not in metrics:
+                    metrics["avg"] = {}
+                metrics["avg"][metric_name] = float(
+                    np.mean([v[metric_name] for k, v in metrics.items() if k != "avg"])
+                )
+
+            logging.info(f"Metrics: {out_metrics}")
+            logging.info(f"avg: {metrics['avg']}")
+            print("metrics", out_metrics)
+            print("avg", metrics["avg"])
         elif dataset_name == "dynamic_replica" or dataset_name == "pointodyssey":
             *_, N, _ = sample.trajectory.shape
             B, T, N = sample.visibility.shape

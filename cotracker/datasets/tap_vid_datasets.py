@@ -50,9 +50,15 @@ def sample_queries_first(
         target_points: Target points of shape [1, n_queries, n_frames, 2] where
           each point is [x, y] scaled to the range [-1, 1]
     """
-    valid = np.sum(~target_occluded, axis=1) > 0
-    target_points = target_points[valid, :]
-    target_occluded = target_occluded[valid, :]
+    # valid = np.sum(~target_occluded, axis=1) > 0
+    # target_points = target_points[valid, :]
+    # target_occluded = target_occluded[valid, :]
+
+    # Remove trajectories that are not visible in the first frame.
+    visibles = np.logical_not(target_occluded)
+    vis_f0_inds = visibles[:, 0]
+    target_points = target_points[vis_f0_inds]
+    target_occluded = target_occluded[vis_f0_inds]
 
     query_points = []
     for i in range(target_points.shape[0]):
@@ -178,12 +184,18 @@ class TapVidDataset(torch.utils.data.Dataset):
 
         target_points = self.points_dataset[video_name]["points"]
         if self.resize_to_256:
-            frames = resize_video(frames, [256, 256])
-            # frames = resize_video(frames, [384, 512])
-            target_points *= np.array([255, 255])  # 1 should be mapped to 256-1
-            # target_points *= np.array([frames.shape[2] - 1, frames.shape[1] - 1])
+            # frames = resize_video(frames, [256, 256])
+            frames = resize_video(frames, [384, 512])
+            # target_points *= np.array([255, 255])  # 1 should be mapped to 256-1
+            target_points *= np.array([frames.shape[2] - 1, frames.shape[1] - 1])
         else:
             target_points *= np.array([frames.shape[2] - 1, frames.shape[1] - 1])
+
+        _, H, W, C = frames.shape
+        assert C == 3
+        assert H == 384
+        assert W == 512
+        target_points = target_points.clip(min=[-64, -64], max=[W + 63, H + 63], out=target_points)
 
         target_occ = self.points_dataset[video_name]["occluded"]
         if self.queried_first:
