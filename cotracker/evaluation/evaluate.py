@@ -106,7 +106,7 @@ def run_eval(cfg: DefaultConfig):
         transformer_mlp_hidden_dim_mult=2,
         transformer_depth=6,
     )
-    weights = torch.load("/home/mila/m/mattie.tesfaldet/Projects/diffusion-pips/data/checkpoints/ndtracker_final.ckpt", map_location="cpu", weights_only=True)
+    weights = torch.load("/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/ndtracker_rel_kub_step_200000_statedict.ckpt", map_location="cpu", weights_only=True)
     weights = {
         k.removeprefix("tracker."): v for k, v in weights.items() if k.startswith("tracker.")
     }

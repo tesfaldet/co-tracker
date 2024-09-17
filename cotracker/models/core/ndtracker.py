@@ -300,8 +300,10 @@ class NDTracker(nn.Module):
         self.transformer = Transformer(
             num_layers=self.transformer_depth,
             in_dim=2 + 2 * self.fourier_proj_dim,
-            cond_dim=self.encoder_dim + self.crop_patch_dim,
+            input_cond_dim=self.encoder_dim + self.crop_patch_dim,
             context_dim=2 + 2 * self.fourier_proj_dim,
+            # context_cond_dim=self.encoder_dim + self.crop_patch_dim,
+            context_cond_dim=self.crop_patch_dim,
             hidden_dim=self.transformer_token_dim,
             num_heads=self.transformer_num_heads,
             out_dim=2,
@@ -339,11 +341,15 @@ class NDTracker(nn.Module):
 
         self.window_size = 16
 
-        sliding_window_step_size = self.window_size // 2  # How much the sliding window moves at every step.
-        num_windows = (T - self.window_size + sliding_window_step_size - 1) // sliding_window_step_size + 1
-        frame_overlap = self.window_size - sliding_window_step_size
+        window_size = self.window_size
 
-        pad = (self.window_size - T % self.window_size) % self.window_size
+        if window_size > T:
+            window_size = T
+
+        sliding_window_step_size = window_size // 2  # How much the sliding window moves at every step.
+        num_windows = (T - window_size + sliding_window_step_size - 1) // sliding_window_step_size + 1
+
+        pad = (window_size - T % window_size) % window_size
         video = F.pad(video.reshape(B, 1, T, C * H * W), (0, 0, 0, pad), "replicate").reshape(
             B, -1, C, H, W
         )
@@ -355,34 +361,40 @@ class NDTracker(nn.Module):
         queried_frames = queries[..., :1]
         queries = torch.cat([queried_coords, queried_frames], dim=2)  # [1, N, 3]
 
-        trajs_prev = queried_coords[:, None]
-
+        # Initialize final predictions.
         trajs_pred_all = queried_coords[:, None].repeat(1, T, 1, 1)  # [1, T, N, 2]
 
         cur_frame = 0
+        end_frame = cur_frame + window_size
         done = False
         query_feats = None
+        trajs_prev = None
+        prev_feat_corrs = None
         while not done:
-            end_frame = cur_frame + self.window_size
+            prev_end_frame = end_frame
+            end_frame = cur_frame + window_size
 
             if end_frame > T:
                 diff = end_frame - T
                 end_frame = end_frame - diff
                 cur_frame = max(cur_frame - diff, 0)
+            frame_overlap = prev_end_frame - cur_frame if cur_frame > 0 else 1
 
-            print(f"Processing frames {cur_frame}:{end_frame - 1} / {T - 1}.")
+            # print(f"Processing frames {cur_frame}:{end_frame - 1} / {T - 1}.")
 
             # Sample trajectories for validation losses.
-            trajs_pred, query_feats, corrs_pyramid = self._forward(
+            trajs_pred, query_feats, prev_feat_corrs, corrs_pyramid = self._forward(
                 video=video[:, cur_frame:end_frame],
                 queries=queries,
                 prev_trajs_coords=trajs_prev,
-                frame_overlap=frame_overlap if cur_frame > 0 else 1,
+                prev_feat_corrs=prev_feat_corrs,
+                frame_overlap=frame_overlap,
                 iters=iters,
                 return_all=True,
                 query_feats=query_feats,
             )
 
+            # Update full-sequence predictions with current window predictions.
             trajs_pred_all[:, cur_frame:end_frame] = trajs_pred[:, -1]  # [1, T_window, N, 2]
             trajs_prev = trajs_pred[:, -1]  # [1, T_window, N, 2]
 
@@ -390,29 +402,31 @@ class NDTracker(nn.Module):
                 done = True
                 trajs_pred_all = trajs_pred_all[:, :T_trimmed]
             else:
-                cur_frame = cur_frame + self.window_size - frame_overlap
+                cur_frame = cur_frame + sliding_window_step_size
 
         return trajs_pred_all, None, None
 
     # TODO: docstring
     def _forward(
         self,
-        video: torch.Tensor,
-        queries: torch.Tensor,
-        prev_trajs_coords: torch.Tensor,
+        video: torch.Tensor,  # [B, T, C, H, W]
+        queries: torch.Tensor,  # [B, N, 3]
+        prev_trajs_coords: torch.Tensor | None,  # [B, T_prev, N, 2]
+        prev_feat_corrs: torch.Tensor | None,  # [B, T_prev, N, LDD]
         frame_overlap: int,
         iters: int,
         return_all: bool = False,
-        query_feats: Optional[torch.Tensor] = None,
-        valids: Optional[torch.Tensor] = None,
+        query_feats: Optional[torch.Tensor] = None,  # [B, 1, N, D]
+        valids: Optional[torch.Tensor] = None,  # [B, T, N]
         **model_kwargs: Any,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         B, T, C, H, W = video.shape
 
-        trajs, prev_trajs, query_coords, query_feats, corrs_pyramid = self.init(
+        trajs, prev_trajs, query_coords, query_feats, prev_feat_corrs, corrs_pyramid = self.init(
             video=video,
             queries=queries,
             prev_trajs_coords=prev_trajs_coords,
+            prev_feat_corrs=prev_feat_corrs,
             frame_overlap=frame_overlap,
             query_feats=query_feats,
         )
@@ -423,6 +437,7 @@ class NDTracker(nn.Module):
             trajs, prev_trajs, query_coords, query_feats = self.update(
                 trajs=trajs,
                 prev_trajs=prev_trajs,
+                prev_feat_corrs=prev_feat_corrs,
                 query_coords=query_coords,
                 query_feats=query_feats,
                 corrs_pyramid=corrs_pyramid,
@@ -440,21 +455,28 @@ class NDTracker(nn.Module):
             if return_all:
                 all_outputs.append(trajs_coords)
 
+        feat_corrs = sample_corrs(
+            corrs_pyramid=corrs_pyramid,
+            coords=trajs_coords / self.encoder_stride,
+            radius=3,
+        )  # B T N LDD
+
         if return_all:
             # Stack outputs to [B, I, ...] tensors, where the `I` dim indexes through the refinement steps.
             all_outputs = torch.stack(all_outputs, dim=1)
         else:
             all_outputs = trajs_coords
 
-        return all_outputs, query_feats, corrs_pyramid
+        return all_outputs, query_feats, feat_corrs, corrs_pyramid
 
     # TODO: docstring
     def update(
         self,
         trajs: torch.Tensor,  # [B, T, N, 3]
         prev_trajs: torch.Tensor,  # [B, T_prev, N, 3]
+        prev_feat_corrs: torch.Tensor,  # [B, T_prev, N, LDD]
         query_coords: torch.Tensor,  # [B, T, N, 2]
-        query_feats: torch.Tensor,  # [B, T, N, D]
+        query_feats: torch.Tensor,  # [B, 1, N, D]
         corrs_pyramid: List[torch.Tensor],  # [B, S, N, H // 2^level, W // 2^level]
         height: int,
         width: int,
@@ -465,6 +487,9 @@ class NDTracker(nn.Module):
         trajs_frame_inds = trajs[..., 2:]  # B T N 1
         prev_trajs_coords = prev_trajs[..., :2]  # [B, T_prev, N, 2]
         prev_trajs_frame_inds = prev_trajs[..., 2:]  # [B, T_prev, N, 1]
+
+        T = trajs_coords.shape[1]
+        T_prev = prev_trajs_coords.shape[1]
 
         # Rescale the track coordinates from [-1, 1] to feature space pixel coordinates in order to sample from the
         # correlation maps.
@@ -480,24 +505,31 @@ class NDTracker(nn.Module):
             radius=3,
         )  # B T N LDD
 
-        # Embed coordinates and frame indices using positional embeddings.
-        trajs_coords_emb = sincos_pos_emb_xy(trajs_coords, self.fourier_proj_dim * 2)  # B T N 2E
-        prev_trajs_coords_emb = sincos_pos_emb_xy(prev_trajs_coords, self.fourier_proj_dim * 2)  # B T_prev N 2E
+        # Embed relative coordinates using positional embeddings.
+        trajs_rel_coords = trajs_coords - trajs_coords[:, :1]  # B T N 2
+        trajs_rel_coords_emb = sincos_pos_emb_xy(trajs_rel_coords, self.fourier_proj_dim * 2)  # B T N 2E
+        prev_trajs_rel_coords = prev_trajs_coords - trajs_coords[:, :1]  # B T_prev N 2
+        prev_trajs_rel_coords_emb = sincos_pos_emb_xy(prev_trajs_rel_coords, self.fourier_proj_dim * 2)  # B T_prev N 2E
 
         # Prepare transformer input, conditioning, and context.
-        transformer_input = torch.cat([trajs_coords, trajs_coords_emb], dim=-1)  # B T N (2E + 2)
-        cond = torch.cat([query_feats, feat_corrs], dim=-1)
-        context = torch.cat([prev_trajs_coords, prev_trajs_coords_emb], dim=-1)  # B T_prev N (2E + 2)
+        transformer_input = torch.cat([trajs_rel_coords, trajs_rel_coords_emb], dim=-1)  # B T N (2E + 2)
+        input_cond = torch.cat([repeat(query_feats, "B 1 N D -> B T N D", T=T), feat_corrs], dim=-1)  # B T N (D + LDD)
+        context = torch.cat([prev_trajs_rel_coords, prev_trajs_rel_coords_emb], dim=-1)  # B T_prev N (2E + 2)
+        # context_cond = torch.cat(
+        #     [repeat(query_feats, "B 1 N D -> B T N D", T=T_prev), prev_feat_corrs], dim=-1
+        # )  # B T_prev N (D + LDD)
+        context_cond = prev_feat_corrs  # B T_prev N LDD
         # attn_mask = valids.bool() if exists(valids) else valids
         attn_mask = None
 
         # Compute diffusion residual prediction.
         delta_pred = self.transformer(
-            transformer_input,
+            input=transformer_input,
             input_pos=trajs_frame_inds,
-            cond=cond,
+            input_cond=input_cond,
             context=context,
             context_pos=prev_trajs_frame_inds,
+            context_cond=context_cond,
             attn_mask=attn_mask,
         )  # B T N 2
 
@@ -513,10 +545,11 @@ class NDTracker(nn.Module):
         self,
         video: torch.Tensor,  # B T C H W
         queries: torch.Tensor,  # B N 3
-        prev_trajs_coords: torch.Tensor,  # B T_prev N 2
+        prev_trajs_coords: torch.Tensor | None,  # B T_prev N 2
+        prev_feat_corrs: torch.Tensor | None,  # B T_prev N LDD
         frame_overlap: int = 1,
-        query_feats: Optional[torch.Tensor] = None,  # B T N D
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        query_feats: Optional[torch.Tensor] = None,  # B 1 N D
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         B, T, C, H, W = video.shape
         B, N, _ = queries.shape
 
@@ -534,8 +567,6 @@ class NDTracker(nn.Module):
         queried_coords = queries[..., :2]  # B N 2
         queried_frames = queries[..., 2:]  # B N 1
 
-        assert torch.all(queried_frames == 0)
-
         # We rescale the coordinates to the feature map space since it's downscaled.
         queried_coords = queried_coords / self.encoder_stride
 
@@ -544,9 +575,20 @@ class NDTracker(nn.Module):
         queries_ = torch.cat([queried_frames, queried_coords], dim=-1).unsqueeze(1)  # B 1 N 3
         corrs_pyramid, query_feats = get_corrs_pyramid(
             fmaps=fmaps, coords=queries_, num_levels=4, sampled_feats=query_feats
-        )
+        )  # List([B, T, N, H // 2^level, W // 2^level]), [B, 1, N, D]
 
-        assert query_feats.shape == (B, T, N, D)
+        assert query_feats.shape == (B, 1, N, D)
+
+        # Assumes we're in the first window, so prev_feat_corrs and prev_trajs_coords are None.
+        # We make prev_trajs_coords the query points and prev_feat_corrs their sampled correlation crops.
+        if not exists(prev_trajs_coords):
+            prev_trajs_coords = queries[..., :2].unsqueeze(1)  # B 1 N 2
+            assert not exists(prev_feat_corrs)
+            prev_feat_corrs = sample_corrs(
+                corrs_pyramid=[c[:, :1] for c in corrs_pyramid],
+                coords=prev_trajs_coords / self.encoder_stride,
+                radius=3,
+            )  # B 1 N LDD
 
         # Rescale previous trajectory coords to [-1, 1].
         prev_trajs_coords = (prev_trajs_coords + 64) / torch.tensor(
@@ -577,11 +619,11 @@ class NDTracker(nn.Module):
 
         # Include rescaled query coords.
         # TODO: This is a hacky way to rescale the trajectories. Find a way that's dataset agnostic.
-        query_coords = repeat(queried_coords * self.encoder_stride, "B N ... -> B T N ...", T=T)  # B T N 2
+        query_coords = (queried_coords * self.encoder_stride).unsqueeze(1)  # B 1 N 2
         query_coords = (query_coords + 64) / torch.tensor([[[[W + 127, H + 127]]]], device=query_coords.device)
         query_coords = 2 * query_coords - 1
 
-        return init_trajs, prev_trajs, query_coords, query_feats, corrs_pyramid  # type: ignore
+        return init_trajs, prev_trajs, query_coords, query_feats, prev_feat_corrs, corrs_pyramid  # type: ignore
 
 
 class Encoder(nn.Module):
@@ -1184,10 +1226,10 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        pos_x: torch.Tensor,
+        input: torch.Tensor,
+        input_pos: torch.Tensor,
         context: Optional[torch.Tensor] = None,
-        pos_context: Optional[torch.Tensor] = None,
+        context_pos: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass of Attention module.
@@ -1202,16 +1244,18 @@ class Attention(nn.Module):
 
         :return: The transformed input tensor using attention.
         """
-        q = rearrange(self.to_q(x), "B N (H C_query) -> B H N C_query", H=self.num_heads, C_query=self.query_key_dim)
-        kv = self.to_kv(default(context, x))
+        q = rearrange(
+            self.to_q(input), "B N (H C_query) -> B H N C_query", H=self.num_heads, C_query=self.query_key_dim
+        )
+        kv = self.to_kv(default(context, input))
         kv = rearrange(kv, "B N (H C_kv) -> B H N C_kv", H=self.num_heads, C_kv=self.query_key_dim + self.value_dim)
         k, v = kv[..., : self.query_key_dim], kv[..., self.query_key_dim :]
 
         q = _l2_norm(q, self.scale[None, :, None, None], dim=-1)
         k = _l2_norm(k, self.scale[None, :, None, None], dim=-1)
 
-        theta_q = self.pos_emb(pos_x)
-        theta_k = self.pos_emb(pos_context) if exists(context) and exists(pos_context) else theta_q
+        theta_q = self.pos_emb(input_pos)
+        theta_k = self.pos_emb(context_pos) if exists(context) and exists(context_pos) else theta_q
         theta_q = rearrange(theta_q, "B N H C -> B H N C")
         theta_k = rearrange(theta_k, "B N H C -> B H N C")
         q = apply_rotary_emb_(q, theta_q)
@@ -1237,20 +1281,31 @@ class AttentionBlock(nn.Module):
     def __init__(
         self,
         in_dim: int,
-        cond_dim: Optional[int] = None,
+        input_cond_dim: Optional[int] = None,
         context_dim: Optional[int] = None,
+        context_cond_dim: Optional[int] = None,
         num_heads: int = 8,
         dropout: float = 0.0,
         attn_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.in_dim = in_dim
-        self.cond_dim = cond_dim
+        self.input_cond_dim = input_cond_dim
         self.context_dim = context_dim
+        self.context_cond_dim = context_cond_dim
         self.num_heads = num_heads
 
-        self.norm_input = AdaRMSNorm(self.in_dim, self.cond_dim) if exists(self.cond_dim) else RMSNorm([self.in_dim])
-        self.norm_context = RMSNorm([self.context_dim]) if exists(self.context_dim) else nn.Identity()
+        self.norm_input = (
+            AdaRMSNorm(self.in_dim, self.input_cond_dim) if exists(self.input_cond_dim) else RMSNorm([self.in_dim])
+        )
+        if exists(self.context_dim):
+            self.norm_context = (
+                AdaRMSNorm(self.context_dim, self.context_cond_dim)
+                if exists(self.context_cond_dim)
+                else RMSNorm([self.context_dim])
+            )
+        else:
+            self.norm_context = nn.Identity()
 
         self.attn = Attention(
             self.in_dim,
@@ -1263,42 +1318,63 @@ class AttentionBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        pos_x: torch.Tensor,
-        cond: Optional[torch.Tensor] = None,
+        input: torch.Tensor,
+        input_pos: torch.Tensor,
+        input_cond: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
-        pos_context: Optional[torch.Tensor] = None,
+        context_pos: Optional[torch.Tensor] = None,
+        context_cond: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        skip = x
-        x = self.norm_input(x, cond) if exists(cond) and exists(self.cond_dim) else self.norm_input(x)
-        context = self.norm_context(context) if exists(context) and exists(self.context_dim) else context
-        x = self.attn(x, pos_x, context=context, pos_context=pos_context, attn_mask=attn_mask)
-        return x + skip
+        skip = input
+        if exists(input_cond) and exists(self.input_cond_dim):
+            input = self.norm_input(input, input_cond)
+        elif exists(self.input_cond_dim):
+            input = _rms_norm(input, torch.ones_like(input), None, dim=-1)
+        else:
+            input = self.norm_input(input)
+
+        if exists(context) and exists(self.context_dim):
+            if exists(context_cond) and exists(self.context_cond_dim):
+                context = self.norm_context(context, context_cond)
+            elif exists(self.context_cond_dim):
+                context = _rms_norm(context, torch.ones_like(context), None, dim=-1)
+            else:
+                context = self.norm_context(context)
+
+        input = self.attn(input, input_pos, context=context, context_pos=context_pos, attn_mask=attn_mask)
+
+        return input + skip
 
 
 class FeedForwardBlock(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int, cond_dim: Optional[int] = None, dropout: float = 0.0) -> None:
+    def __init__(
+        self, in_dim: int, hidden_dim: int, input_cond_dim: Optional[int] = None, dropout: float = 0.0
+    ) -> None:
         super().__init__()
         self.in_dim = in_dim
-        self.cond_dim = cond_dim
+        self.input_cond_dim = input_cond_dim
         self.hidden_dim = hidden_dim
 
-        self.norm = AdaRMSNorm(self.in_dim, self.cond_dim) if exists(self.cond_dim) else RMSNorm([self.in_dim])
+        self.norm = (
+            AdaRMSNorm(self.in_dim, self.input_cond_dim) if exists(self.input_cond_dim) else RMSNorm([self.in_dim])
+        )
         self.up_proj = apply_wd(LinearGEGLU(self.in_dim, self.hidden_dim, bias=False))
         self.dropout = nn.Dropout(dropout, inplace=True)
         self.down_proj = apply_wd(zero_init(nn.Linear(self.hidden_dim, self.in_dim, bias=False)))
 
-    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
-        skip = x
-        if exists(cond) and exists(self.cond_dim):
-            x = self.norm(x, cond)
+    def forward(self, input: torch.Tensor, input_cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        skip = input
+        if exists(input_cond) and exists(self.input_cond_dim):
+            input = self.norm(input, input_cond)
+        elif exists(self.input_cond_dim):
+            input = _rms_norm(input, torch.ones_like(input), None, dim=-1)
         else:
-            x = self.norm(x)
-        x = self.up_proj(x)
-        x = self.dropout(x)
-        x = self.down_proj(x)
-        return x + skip
+            input = self.norm(input)
+        input = self.up_proj(input)
+        input = self.dropout(input)
+        input = self.down_proj(input)
+        return input + skip
 
 
 class GlobalTransformerLayer(nn.Module):
@@ -1307,42 +1383,46 @@ class GlobalTransformerLayer(nn.Module):
         in_dim: int,
         hidden_dim: int,
         num_heads: int,
-        cond_dim: Optional[int] = None,
+        input_cond_dim: Optional[int] = None,
         context_dim: Optional[int] = None,
+        context_cond_dim: Optional[int] = None,
         dropout: float = 0.0,
         attn_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.in_dim = in_dim
-        self.cond_dim = cond_dim
+        self.input_cond_dim = input_cond_dim
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.context_dim = context_dim
+        self.context_cond_dim = context_cond_dim
 
         self.attn = AttentionBlock(
             in_dim=self.in_dim,
-            cond_dim=self.cond_dim,
+            input_cond_dim=self.input_cond_dim,
             context_dim=self.context_dim,
+            context_cond_dim=self.context_cond_dim,
             num_heads=self.num_heads,
             dropout=dropout,
             attn_dropout=attn_dropout,
         )
         self.ff = FeedForwardBlock(
-            in_dim=self.in_dim, hidden_dim=self.hidden_dim, cond_dim=self.cond_dim, dropout=dropout
+            in_dim=self.in_dim, hidden_dim=self.hidden_dim, input_cond_dim=self.input_cond_dim, dropout=dropout
         )
 
     def forward(
         self,
-        x: torch.Tensor,
-        pos_x: torch.Tensor,
-        cond: Optional[torch.Tensor] = None,
+        input: torch.Tensor,
+        input_pos: torch.Tensor,
+        input_cond: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
-        pos_context: Optional[torch.Tensor] = None,
+        context_pos: Optional[torch.Tensor] = None,
+        context_cond: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        x = self.attn(x, pos_x, cond, context, pos_context, attn_mask)
-        x = self.ff(x, cond)
-        return x
+        input = self.attn(input, input_pos, input_cond, context, context_pos, context_cond, attn_mask)
+        input = self.ff(input, input_cond)
+        return input
 
 
 class MappingFeedForwardBlock(nn.Module):
@@ -1403,8 +1483,9 @@ class Transformer(nn.Module):
         num_heads: int,
         out_dim: int,
         mlp_hidden_dim_mult: int,
-        cond_dim: Optional[int] = None,
+        input_cond_dim: Optional[int] = None,
         context_dim: Optional[int] = None,
+        context_cond_dim: Optional[int] = None,
         dropout: float = 0.0,
         temporal_attn_dropout: float = 0.0,
         spatial_attn_dropout: float = 0.0,
@@ -1418,8 +1499,9 @@ class Transformer(nn.Module):
         :param num_heads: Number of heads in the multi-head attention.
         :param out_dim: Number of channels in the the output.
         :param mlp_hidden_dim_mult: The hidden dimension multiplier for the MLP in the attention blocks.
-        :param cond_dim: Number of channels in the conditioning tensor. Default is `None`.
+        :param input_cond_dim: Number of channels in the input conditioning tensor. Default is `None`.
         :param context_dim: Number of channels in the context tensor. Default is `None`.
+        :param context_cond_dim: Number of channels in the context conditioning tensor. Default is `None`.
         :param dropout: Dropout rate. Default is `0.0`.
         :param temporal_attn_dropout: Dropout rate for the temporal self-attention weights, post-softmax.
         Default is `0.0`.
@@ -1429,8 +1511,9 @@ class Transformer(nn.Module):
         super().__init__()
         self.num_layers = num_layers
         self.in_dim = in_dim
-        self.cond_dim = cond_dim
+        self.input_cond_dim = input_cond_dim
         self.context_dim = context_dim
+        self.context_cond_dim = context_cond_dim
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.out_dim = out_dim
@@ -1446,23 +1529,35 @@ class Transformer(nn.Module):
         self.virtual_points = nn.Parameter(torch.randn(1, 1, 64, self.hidden_dim))
 
         # Mapping network for conditioning input.
-        if exists(self.cond_dim):
-            self.mapping = MappingNetwork(
-                in_dim=self.cond_dim,  # type: ignore
+        if exists(self.input_cond_dim):
+            self.input_cond_mapping = MappingNetwork(
+                in_dim=self.input_cond_dim,  # type: ignore
                 hidden_dim=self.hidden_dim * self.mlp_hidden_dim_mult,
-                out_dim=self.cond_dim,  # type: ignore
+                out_dim=self.input_cond_dim,  # type: ignore
                 num_layers=2,
                 dropout=mapping_dropout,
             )
-            self.mapping = tag_module(self.mapping, "mapping")
+            self.input_cond_mapping = tag_module(self.input_cond_mapping, "mapping")
+
+        # Mapping network for conditioning context.
+        if exists(self.context_cond_dim):
+            self.context_cond_mapping = MappingNetwork(
+                in_dim=self.context_cond_dim,  # type: ignore
+                hidden_dim=self.hidden_dim * self.mlp_hidden_dim_mult,
+                out_dim=self.context_cond_dim,  # type: ignore
+                num_layers=2,
+                dropout=mapping_dropout,
+            )
+            self.context_cond_mapping = tag_module(self.context_cond_mapping, "mapping")
 
         # Initialize the attention blocks.
         Input2ContextCrossAttnBlock = partial(
             GlobalTransformerLayer,
             in_dim=self.hidden_dim,
-            cond_dim=self.cond_dim,
+            input_cond_dim=self.input_cond_dim,
             hidden_dim=self.hidden_dim * self.mlp_hidden_dim_mult,
             context_dim=self.hidden_dim,
+            context_cond_dim=self.context_cond_dim,
             num_heads=self.num_heads,
             dropout=dropout,
             attn_dropout=temporal_attn_dropout,
@@ -1470,9 +1565,10 @@ class Transformer(nn.Module):
         Virtual2InputCrossAttnBlock = partial(
             GlobalTransformerLayer,
             in_dim=self.hidden_dim,
-            cond_dim=None,
+            input_cond_dim=None,
             hidden_dim=self.hidden_dim * self.mlp_hidden_dim_mult,
             context_dim=self.hidden_dim,
+            context_cond_dim=self.input_cond_dim,
             num_heads=self.num_heads,
             dropout=dropout,
             attn_dropout=spatial_attn_dropout,
@@ -1480,9 +1576,10 @@ class Transformer(nn.Module):
         Input2VirtualCrossAttnBlock = partial(
             GlobalTransformerLayer,
             in_dim=self.hidden_dim,
-            cond_dim=self.cond_dim,
+            input_cond_dim=self.input_cond_dim,
             hidden_dim=self.hidden_dim * self.mlp_hidden_dim_mult,
             context_dim=self.hidden_dim,
+            context_cond_dim=None,
             num_heads=self.num_heads,
             dropout=dropout,
             attn_dropout=spatial_attn_dropout,
@@ -1490,9 +1587,10 @@ class Transformer(nn.Module):
         InputSelfAttnBlock = partial(
             GlobalTransformerLayer,
             in_dim=self.hidden_dim,
-            cond_dim=self.cond_dim,
+            input_cond_dim=self.input_cond_dim,
             hidden_dim=self.hidden_dim * self.mlp_hidden_dim_mult,
             context_dim=None,
+            context_cond_dim=None,
             num_heads=self.num_heads,
             dropout=dropout,
             attn_dropout=temporal_attn_dropout,
@@ -1526,11 +1624,12 @@ class Transformer(nn.Module):
 
     def forward(
         self,
-        input_tensor: torch.Tensor,
+        input: torch.Tensor,
         input_pos: torch.Tensor,
+        input_cond: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_pos: Optional[torch.Tensor] = None,
-        cond: Optional[torch.Tensor] = None,
+        context_cond: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass of the model to produce track updates.
@@ -1547,13 +1646,14 @@ class Transformer(nn.Module):
         updating the track estimates (the coordinates and features).
         """
         # Tokenize input.
-        tokens = self.input_transform(input_tensor)
+        tokens = self.input_transform(input)
         B, T, N, E = tokens.shape
         tokens = rearrange(tokens, "B T N E -> (B N) T E")
         tokens_pos = rearrange(input_pos, "B T N E -> (B N) T E")
 
         context_exists = exists(context) and exists(self.context_dim)
-        cond_exists = exists(cond) and exists(self.cond_dim)
+        input_cond_exists = exists(input_cond) and exists(self.input_cond_dim)
+        context_cond_exists = exists(context_cond) and exists(self.context_cond_dim)
 
         # Tokenize context.
         if context_exists:
@@ -1571,59 +1671,70 @@ class Transformer(nn.Module):
         else:
             input2context_attn_mask = virtual2input_attn_mask = input2virtual_attn_mask = input_attn_mask = None
 
-        if cond_exists:
-            cond = self.mapping(cond)  # B T N F
-            cond = rearrange(cond, "B T N F -> (B N) T F")
+        if input_cond_exists:
+            input_cond = self.input_cond_mapping(input_cond)  # B T N F
+            input_cond = rearrange(input_cond, "B T N F -> (B N) T F")
+
+        if context_cond_exists:
+            context_cond = self.context_cond_mapping(context_cond)  # B H N F
+            context_cond = rearrange(context_cond, "B H N F -> (B N) H F")
+
+        # Prepare virtual tokens.
+        virtual_tokens = repeat(self.virtual_points, "1 1 V E -> B T V E", B=B, T=T)
+        virtual_tokens = rearrange(virtual_tokens, "B T V E -> (B T) V E")
+        virtual_tokens_pos = repeat(input_pos[..., :1, :], "B T 1 E -> B T V E", V=64)
+        virtual_tokens_pos = rearrange(virtual_tokens_pos, "B T V E -> (B T) V E")
 
         if context_exists:
-            # Update input tokens by having them x-attend to context_tokens.
+            # Update input tokens by having them temporally x-attend to context_tokens.
             tokens = self.input2context_xattn_block(
-                tokens,
-                tokens_pos,
-                cond=cond,
+                input=tokens,
+                input_pos=tokens_pos,
+                input_cond=input_cond,
                 context=context_tokens,
-                pos_context=context_tokens_pos,
+                context_pos=context_tokens_pos,
+                context_cond=context_cond,
                 attn_mask=input2context_attn_mask,
             )
 
-        # Prepare virtual tokens for spatial x-attention.
-        virtual_tokens = repeat(self.virtual_points, "1 1 V E -> B T V E", B=B, T=T)
-        virtual_tokens = rearrange(virtual_tokens, "B T V E -> (B T) V E")
-        virtual_tokens_pos = rearrange(input_pos[..., :1, :], "B T N E -> (B T) N E")
-        virtual_tokens_pos = repeat(virtual_tokens_pos, "BT 1 E -> BT V E", V=64)
-
-        # Rearranging input tokens for spatial x-attention.
+        # Rearranging input and virtual tokens for spatial x-attention.
         tokens = rearrange(tokens, "(B N) T E -> (B T) N E", B=B, N=N)
         tokens_pos = rearrange(tokens_pos, "(B N) T E -> (B T) N E", B=B, N=N)
-        cond = rearrange(cond, "(B N) T F -> (B T) N F", B=B, N=N) if cond_exists else cond
+        input_cond = rearrange(input_cond, "(B N) T F -> (B T) N F", B=B, N=N) if input_cond_exists else input_cond
 
         # Update virtual tokens by having them spatially x-attend to input tokens.
         virtual_tokens = self.virtual2input_xattn_block(
-            virtual_tokens,
-            virtual_tokens_pos,
+            input=virtual_tokens,
+            input_pos=virtual_tokens_pos,
             context=tokens,
-            pos_context=tokens_pos,
+            context_pos=tokens_pos,
+            context_cond=input_cond,
             attn_mask=virtual2input_attn_mask,
         )
 
         # Update input tokens by having them spatially x-attend to virtual tokens.
         tokens = self.input2virtual_xattn_block(
-            tokens,
-            tokens_pos,
-            cond=cond,
+            input=tokens,
+            input_pos=tokens_pos,
+            input_cond=input_cond,
             context=virtual_tokens,
-            pos_context=virtual_tokens_pos,
+            context_pos=virtual_tokens_pos,
             attn_mask=input2virtual_attn_mask,
         )
 
-        # Rearranging input tokens for self-attention.
+        # Rearranging input and virtual tokens for self-attention.
         tokens = rearrange(tokens, "(B T) N E -> (B N) T E", B=B, T=T)
         tokens_pos = rearrange(tokens_pos, "(B T) N E -> (B N) T E", B=B, T=T)
-        cond = rearrange(cond, "(B T) N F -> (B N) T F", B=B, T=T) if cond_exists else cond
+        input_cond = rearrange(input_cond, "(B T) N F -> (B N) T F", B=B, T=T) if input_cond_exists else input_cond
 
         for i in range(self.num_layers):
-            # Update input tokens by having them self-attend to themselves.
-            tokens = self.input_self_attn_blocks[i](tokens, tokens_pos, cond=cond, attn_mask=input_attn_mask)
+            # Update input tokens by having them temporally self-attend to themselves.
+            tokens = self.input_self_attn_blocks[i](
+                input=tokens,
+                input_pos=tokens_pos,
+                input_cond=input_cond,
+                attn_mask=input_attn_mask,
+            )
 
         tokens = self.out_norm(tokens)
         tokens = rearrange(tokens, "(B N) T E -> B T N E", B=B, N=N)
@@ -1793,10 +1904,11 @@ def get_corrs_pyramid(
 
     # Sample features at coords at the base pyramid level.
     if not exists(sampled_feats):
-        sampled_feats = repeat(sample_features_5d(fmaps, coords, padding_mode=padding_mode), "B 1 N D -> B T N D", T=T)
+        sampled_feats = sample_features_5d(fmaps, coords, padding_mode=padding_mode)  # [B, 1, N, D]
 
     # Correlate feature maps with the sampled features.
-    corrs = einsum(sampled_feats, rearrange(fmaps, "B T C H W -> B T C (H W)"), "B T I C, B T C J -> B T I J")
+    sampled_feats_ = repeat(sampled_feats, "B 1 N D -> B T N D", T=T)
+    corrs = einsum(sampled_feats_, rearrange(fmaps, "B T C H W -> B T C (H W)"), "B T I C, B T C J -> B T I J")
     corrs = rearrange(corrs, "B T N (H W) -> B T N H W", H=H, W=W) * norm_factor
 
     corrs_pyramid = [corrs]
