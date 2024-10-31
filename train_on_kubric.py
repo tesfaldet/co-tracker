@@ -11,61 +11,68 @@ import signal
 import socket
 import sys
 import json
-
+import torch.nn.functional as F
 import numpy as np
 import argparse
 import logging
 from pathlib import Path
 from tqdm import tqdm
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler
 
-from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import GradScaler
 from pytorch_lightning.lite import LightningLite
 
-from cotracker.models.evaluation_predictor import EvaluationPredictor
-from cotracker.models.core.cotracker.cotracker import CoTracker2
+from cotracker.models.core.cotracker.cotracker3_offline import CoTrackerThreeOffline
+from cotracker.models.core.cotracker.cotracker3_online import CoTrackerThreeOnline
+
 from cotracker.utils.visualizer import Visualizer
-from cotracker.datasets.tap_vid_datasets import TapVidDataset
-
-from cotracker.datasets.dr_dataset import DynamicReplicaDataset
+from cotracker.models.core.model_utils import get_uniformly_sampled_pts
 from cotracker.evaluation.core.evaluator import Evaluator
-from cotracker.datasets import kubric_movif_dataset
 from cotracker.datasets.utils import collate_fn, collate_fn_train, dataclass_to_cuda_
-from cotracker.models.core.cotracker.losses import sequence_loss, balanced_ce_loss
-
-
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-
-
-# define the handler function
-# for training on a slurm cluster
-def sig_handler(signum, frame):
-    print("caught signal", signum)
-    print(socket.gethostname(), "USR1 signal caught.")
-    # do other stuff to cleanup here
-    print("requeuing job " + os.environ["SLURM_JOB_ID"])
-    os.system("scontrol requeue " + os.environ["SLURM_JOB_ID"])
-    sys.exit(-1)
-
-
-def term_handler(signum, frame):
-    print("bypassing sigterm", flush=True)
+from cotracker.models.core.cotracker.losses import (
+    sequence_loss,
+    sequence_BCE_loss,
+    sequence_prob_loss,
+)
+from cotracker.utils.train_utils import (
+    Logger,
+    get_eval_dataloader,
+    get_train_dataset,
+    sig_handler,
+    term_handler,
+    run_test_eval,
+)
 
 
 def fetch_optimizer(args, model):
     """Create the optimizer and learning rate scheduler"""
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wdecay, eps=1e-8)
+    mlp_params = sum(
+        p.numel()
+        for name, p in model.named_parameters()
+        if p.requires_grad and "corr_mlp" in name
+    )
+    print(f"Total number of MlP parameters: {mlp_params}")
+
+    mlp_params = sum(
+        p.numel()
+        for name, p in model.named_parameters()
+        if p.requires_grad and "cmdtop" in name
+    )
+    print(f"Total number of cmdtop parameters: {mlp_params}")
+
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total number of parameters: {total_params}")
+    optimizer = optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.wdecay, eps=1e-8
+    )
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
         args.lr,
         args.num_steps + 100,
         pct_start=0.05,
         cycle_momentum=False,
-        anneal_strategy="linear",
+        anneal_strategy="cos",
     )
-
     return optimizer, scheduler
 
 
@@ -74,162 +81,150 @@ def forward_batch(batch, model, args):
     trajs_g = batch.trajectory
     vis_g = batch.visibility
     valids = batch.valid
+
     B, T, C, H, W = video.shape
     assert C == 3
     B, T, N, D = trajs_g.shape
     device = video.device
 
     __, first_positive_inds = torch.max(vis_g, dim=1)
-    # We want to make sure that during training the model sees visible points
-    # that it does not need to track just yet: they are visible but queried from a later frame
-    N_rand = N // 4
-    # inds of visible points in the 1st frame
-    nonzero_inds = [[torch.nonzero(vis_g[b, :, i]) for i in range(N)] for b in range(B)]
 
-    for b in range(B):
-        rand_vis_inds = torch.cat(
-            [
-                nonzero_row[torch.randint(len(nonzero_row), size=(1,))]
-                for nonzero_row in nonzero_inds[b]
-            ],
-            dim=1,
+    if args.query_sampling_method == "random":
+        assert B == 1
+        true_indices = torch.nonzero(vis_g[0])
+        # Group the indices by the first column (N)
+        grouped_indices = true_indices[:, 1].unique()
+        # Initialize an empty tensor to hold the sampled points
+        sampled_points = torch.empty((B, N, D))
+        indices = torch.empty((B, N, 1))
+        # For each unique N
+        for n in grouped_indices:
+            # Get the T indices where visibilities[0, :, n] is True
+            t_indices = true_indices[true_indices[:, 1] == n, 0]
+
+            # Select a random index from t_indices
+            random_index = t_indices[torch.randint(0, len(t_indices), (1,))]
+
+            # Use this random index to sample a point from the trajectories tensor
+            sampled_points[0, n] = trajs_g[0, random_index, n]
+            indices[0, n] = random_index.float()
+        # model.window_len = vis_g.shape[1]
+        queries = torch.cat([indices, sampled_points], dim=2)
+    else:
+        # We want to make sure that during training the model sees visible points
+        # that it does not need to track just yet: they are visible but queried from a later frame
+        N_rand = N // 4
+        # inds of visible points in the 1st frame
+        nonzero_inds = [
+            [torch.nonzero(vis_g[b, :, i]) for i in range(N)] for b in range(B)
+        ]
+
+        for b in range(B):
+            rand_vis_inds = torch.cat(
+                [
+                    nonzero_row[torch.randint(len(nonzero_row), size=(1,))]
+                    for nonzero_row in nonzero_inds[b]
+                ],
+                dim=1,
+            )
+            first_positive_inds[b] = torch.cat(
+                [rand_vis_inds[:, :N_rand], first_positive_inds[b : b + 1, N_rand:]],
+                dim=1,
+            )
+
+        ind_array_ = torch.arange(T, device=device)
+        ind_array_ = ind_array_[None, :, None].repeat(B, 1, N)
+        assert torch.allclose(
+            vis_g[ind_array_ == first_positive_inds[:, None, :]],
+            torch.ones(1, device=device),
         )
-        first_positive_inds[b] = torch.cat(
-            [rand_vis_inds[:, :N_rand], first_positive_inds[b : b + 1, N_rand:]], dim=1
+        gather = torch.gather(
+            trajs_g, 1, first_positive_inds[:, :, None, None].repeat(1, 1, N, D)
         )
+        xys = torch.diagonal(gather, dim1=1, dim2=2).permute(0, 2, 1)
 
-    ind_array_ = torch.arange(T, device=device)
-    ind_array_ = ind_array_[None, :, None].repeat(B, 1, N)
-    assert torch.allclose(
-        vis_g[ind_array_ == first_positive_inds[:, None, :]],
-        torch.ones(1, device=device),
+        queries = torch.cat([first_positive_inds[:, :, None], xys[:, :, :2]], dim=2)
+
+    assert B == 1
+
+    if (
+        torch.isnan(queries).any()
+        or torch.isnan(trajs_g).any()
+        or queries.abs().max() > 1500
+    ):
+        print("failed_sample")
+        print("queries time", queries[..., 0])
+        print("queries ", queries[..., 1:])
+        queries = torch.ones_like(queries).to(queries.device).float()
+        print("new queries", queries)
+        valids = torch.zeros_like(valids).to(valids.device).float()
+        print("new valids", valids)
+
+    model_output = model(
+        video=video, queries=queries[..., :3], iters=args.train_iters, is_train=True
     )
-    gather = torch.gather(trajs_g, 1, first_positive_inds[:, :, None, None].repeat(1, 1, N, D))
-    xys = torch.diagonal(gather, dim1=1, dim2=2).permute(0, 2, 1)
 
-    queries = torch.cat([first_positive_inds[:, :, None], xys[:, :, :2]], dim=2)
-
-    predictions, visibility, train_data = model(
-        video=video, queries=queries, iters=args.train_iters, is_train=True
-    )
-    coord_predictions, vis_predictions, valid_mask = train_data
+    tracks, visibility, confidence, train_data = model_output
+    coord_predictions, vis_predictions, confidence_predicitons, valid_mask = train_data
 
     vis_gts = []
+    invis_gts = []
     traj_gts = []
     valids_gts = []
 
-    S = args.sliding_window_len
-    for ind in range(0, args.sequence_len - S // 2, S // 2):
-        vis_gts.append(vis_g[:, ind : ind + S])
-        traj_gts.append(trajs_g[:, ind : ind + S])
-        valids_gts.append(valids[:, ind : ind + S] * valid_mask[:, ind : ind + S])
-        
-    seq_loss = sequence_loss(coord_predictions, traj_gts, vis_gts, valids_gts, 0.8)
-    vis_loss = balanced_ce_loss(vis_predictions, vis_gts, valids_gts)
+    if args.offline_model:
+        S = T
+        seq_len = (S // 2) + 1
+    else:
+        S = args.sliding_window_len
+        seq_len = T
 
-    output = {"flow": {"predictions": predictions[0].detach()}}
-    output["flow"]["loss"] = seq_loss.mean()
+    for ind in range(0, seq_len - S // 2, S // 2):
+        vis_gts.append(vis_g[:, ind : ind + S])
+        invis_gts.append(1 - vis_g[:, ind : ind + S])
+        traj_gts.append(trajs_g[:, ind : ind + S, :, :2])
+        val = valids[:, ind : ind + S]
+        if not args.offline_model:
+            val = val * valid_mask[:, ind : ind + S]
+        valids_gts.append(val)
+
+    seq_loss_visible = sequence_loss(
+        coord_predictions,
+        traj_gts,
+        valids_gts,
+        vis=vis_gts,
+        gamma=0.8,
+        add_huber_loss=args.add_huber_loss,
+        loss_only_for_visible=True,
+    )
+    confidence_loss = sequence_prob_loss(
+        coord_predictions, confidence_predicitons, traj_gts, vis_gts
+    )
+    vis_loss = sequence_BCE_loss(vis_predictions, vis_gts)
+
+    output = {"flow": {"predictions": tracks[0].detach()}}
+    output["flow"]["loss"] = seq_loss_visible.mean() * 0.05
+    output["flow"]["queries"] = queries.clone()
+
+    if not args.train_only_on_visible:
+        seq_loss_invisible = sequence_loss(
+            coord_predictions,
+            traj_gts,
+            valids_gts,
+            vis=invis_gts,
+            gamma=0.8,
+            add_huber_loss=False,
+            loss_only_for_visible=True,
+        )
+        output["flow_invisible"] = {"loss": seq_loss_invisible.mean() * 0.01}
     output["visibility"] = {
-        "loss": vis_loss.mean() * 10.0,
+        "loss": vis_loss.mean(),
         "predictions": visibility[0].detach(),
     }
+    output["confidence"] = {
+        "loss": confidence_loss.mean(),
+    }
     return output
-
-
-def run_test_eval(evaluator, model, dataloaders, writer, step):
-    model.eval()
-    for ds_name, dataloader in dataloaders:
-        visualize_every = 1
-        grid_size = 5
-        if ds_name == "dynamic_replica":
-            visualize_every = 8
-            grid_size = 0
-        elif "tapvid" in ds_name:
-            visualize_every = 5
-
-        predictor = EvaluationPredictor(
-            model.module.module,
-            grid_size=grid_size,
-            local_grid_size=0,
-            single_point=False,
-            n_iters=6,
-        )
-        if torch.cuda.is_available():
-            predictor.model = predictor.model.cuda()
-
-        metrics = evaluator.evaluate_sequence(
-            model=predictor,
-            test_dataloader=dataloader,
-            dataset_name=ds_name,
-            train_mode=True,
-            writer=writer,
-            step=step,
-            visualize_every=visualize_every,
-        )
-
-        if ds_name == "dynamic_replica" or ds_name == "kubric":
-            metrics = {f"{ds_name}_avg_{k}": v for k, v in metrics["avg"].items()}
-
-        if "tapvid" in ds_name:
-            metrics = {
-                f"{ds_name}_avg_OA": metrics["avg"]["occlusion_accuracy"],
-                f"{ds_name}_avg_delta": metrics["avg"]["average_pts_within_thresh"],
-                f"{ds_name}_avg_Jaccard": metrics["avg"]["average_jaccard"],
-            }
-
-        writer.add_scalars(f"Eval_{ds_name}", metrics, step)
-
-
-class Logger:
-    SUM_FREQ = 100
-
-    def __init__(self, model, scheduler):
-        self.model = model
-        self.scheduler = scheduler
-        self.total_steps = 0
-        self.running_loss = {}
-        self.writer = SummaryWriter(log_dir=os.path.join(args.ckpt_path, "runs"))
-
-    def _print_training_status(self):
-        metrics_data = [
-            self.running_loss[k] / Logger.SUM_FREQ for k in sorted(self.running_loss.keys())
-        ]
-        training_str = "[{:6d}] ".format(self.total_steps + 1)
-        metrics_str = ("{:10.4f}, " * len(metrics_data)).format(*metrics_data)
-
-        # print the training status
-        logging.info(f"Training Metrics ({self.total_steps}): {training_str + metrics_str}")
-
-        if self.writer is None:
-            self.writer = SummaryWriter(log_dir=os.path.join(args.ckpt_path, "runs"))
-
-        for k in self.running_loss:
-            self.writer.add_scalar(k, self.running_loss[k] / Logger.SUM_FREQ, self.total_steps)
-            self.running_loss[k] = 0.0
-
-    def push(self, metrics, task):
-        self.total_steps += 1
-
-        for key in metrics:
-            task_key = str(key) + "_" + task
-            if task_key not in self.running_loss:
-                self.running_loss[task_key] = 0.0
-
-            self.running_loss[task_key] += metrics[key]
-
-        if self.total_steps % Logger.SUM_FREQ == Logger.SUM_FREQ - 1:
-            self._print_training_status()
-            self.running_loss = {}
-
-    def write_dict(self, results):
-        if self.writer is None:
-            self.writer = SummaryWriter(log_dir=os.path.join(args.ckpt_path, "runs"))
-
-        for key in results:
-            self.writer.add_scalar(key, results[key], self.total_steps)
-
-    def close(self):
-        self.writer.close()
 
 
 class Lite(LightningLite):
@@ -243,61 +238,70 @@ class Lite(LightningLite):
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
 
-        seed_everything(0)
+        seed_everything(42)
 
         def seed_worker(worker_id):
             worker_seed = torch.initial_seed() % 2**32
-            np.random.seed(worker_seed)
-            random.seed(worker_seed)
+            np.random.seed(worker_seed + worker_id)
+            random.seed(worker_seed + worker_id)
 
         g = torch.Generator()
-        g.manual_seed(0)
+        g.manual_seed(42)
         if self.global_rank == 0:
             eval_dataloaders = []
-            if "dynamic_replica" in args.eval_datasets:
-                eval_dataset = DynamicReplicaDataset(
-                    sample_len=60, only_first_n_samples=1, rgbd_input=False
+            for ds_name in args.eval_datasets:
+                eval_dataloaders.append(
+                    (ds_name, get_eval_dataloader(args.dataset_root, ds_name))
                 )
-                eval_dataloader_dr = torch.utils.data.DataLoader(
-                    eval_dataset,
-                    batch_size=1,
-                    shuffle=False,
-                    num_workers=1,
-                    collate_fn=collate_fn,
-                )
-                eval_dataloaders.append(("dynamic_replica", eval_dataloader_dr))
+            if not args.debug:
+                final_dataloaders = [dl for dl in eval_dataloaders]
 
-            if "tapvid_davis_first" in args.eval_datasets:
-                # data_root = os.path.join(args.dataset_root, "tapvid/tapvid_davis/tapvid_davis.pkl")
-                data_root = "/home/mila/m/mattie.tesfaldet/scratch/Projects/diffusion-pips/datasets/tapvid_davis/tapvid_davis.pkl"
-                eval_dataset = TapVidDataset(dataset_type="davis", data_root=data_root)
-                eval_dataloader_tapvid_davis = torch.utils.data.DataLoader(
-                    eval_dataset,
-                    batch_size=1,
-                    shuffle=False,
-                    num_workers=1,
-                    collate_fn=collate_fn,
+                ds_name = "dynamic_replica"
+                final_dataloaders.append(
+                    (ds_name, get_eval_dataloader(args.dataset_root, ds_name))
                 )
-                eval_dataloaders.append(("tapvid_davis", eval_dataloader_tapvid_davis))
+
+                ds_name = "tapvid_robotap"
+                final_dataloaders.append(
+                    (ds_name, get_eval_dataloader(args.dataset_root, ds_name))
+                )
+
+                ds_name = "tapvid_kinetics_first"
+                final_dataloaders.append(
+                    (ds_name, get_eval_dataloader(args.dataset_root, ds_name))
+                )
 
             evaluator = Evaluator(args.ckpt_path)
 
             visualizer = Visualizer(
                 save_dir=args.ckpt_path,
-                pad_value=80,
+                pad_value=180,
                 fps=1,
                 show_first_frame=0,
                 tracks_leave_trace=0,
             )
 
-        if args.model_name == "cotracker":
-            model = CoTracker2(
-                stride=args.model_stride,
-                window_len=args.sliding_window_len,
-                add_space_attn=not args.remove_space_attn,
-                num_virtual_tracks=args.num_virtual_tracks,
-                model_resolution=args.crop_size,
-            )
+        if args.model_name == "cotracker_three":
+            if args.offline_model:
+                model = CoTrackerThreeOffline(
+                    stride=args.model_stride,
+                    corr_radius=args.corr_radius,
+                    corr_levels=args.corr_levels,
+                    window_len=args.sliding_window_len,
+                    num_virtual_tracks=args.num_virtual_tracks,
+                    model_resolution=args.crop_size,
+                    linear_layer_for_vis_conf=args.linear_layer_for_vis_conf,
+                )
+            else:
+                model = CoTrackerThreeOnline(
+                    stride=args.model_stride,
+                    corr_radius=args.corr_radius,
+                    corr_levels=args.corr_levels,
+                    window_len=args.sliding_window_len,
+                    num_virtual_tracks=args.num_virtual_tracks,
+                    model_resolution=args.crop_size,
+                    linear_layer_for_vis_conf=args.linear_layer_for_vis_conf,
+                )
         else:
             raise ValueError(f"Model {args.model_name} doesn't exist")
 
@@ -306,17 +310,8 @@ class Lite(LightningLite):
 
         model.cuda()
 
-        train_dataset = kubric_movif_dataset.KubricMovifDataset(
-            # data_root=os.path.join(args.dataset_root, "kubric", "kubric_movi_f_tracks"),
-            data_root="/home/mila/m/mattie.tesfaldet/scratch/Projects/diffusion-pips/datasets/kubric_movi_f",
-            crop_size=args.crop_size,
-            seq_len=args.sequence_len,
-            traj_per_sample=args.traj_per_sample,
-            sample_vis_1st_frame=args.sample_vis_1st_frame,
-            use_augs=not args.dont_use_augs,
-        )
-
-        train_loader = DataLoader(
+        train_dataset = get_train_dataset(args)
+        train_loader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
@@ -327,14 +322,13 @@ class Lite(LightningLite):
             collate_fn=collate_fn_train,
             drop_last=True,
         )
-
         train_loader = self.setup_dataloaders(train_loader, move_to_device=False)
         print("LEN TRAIN LOADER", len(train_loader))
         optimizer, scheduler = fetch_optimizer(args, model)
 
         total_steps = 0
         if self.global_rank == 0:
-            logger = Logger(model, scheduler)
+            logger = Logger(model, scheduler, ckpt_path=args.ckpt_path)
 
         folder_ckpts = [
             f
@@ -360,16 +354,24 @@ class Lite(LightningLite):
                 logging.info(f"Load total_steps {total_steps}")
 
         elif args.restore_ckpt is not None:
-            assert args.restore_ckpt.endswith(".pth") or args.restore_ckpt.endswith(".pt")
+            assert args.restore_ckpt.endswith(".pth") or args.restore_ckpt.endswith(
+                ".pt"
+            )
             logging.info("Loading checkpoint...")
 
-            strict = True
+            strict = False
             state_dict = self.load(args.restore_ckpt)
             if "model" in state_dict:
                 state_dict = state_dict["model"]
-
+            state_dict = {
+                k: v
+                for k, v in state_dict.items()
+                if "time_emb" not in k and "pos_emb" not in k
+            }
             if list(state_dict.keys())[0].startswith("module."):
-                state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+                state_dict = {
+                    k.replace("module.", ""): v for k, v in state_dict.items()
+                }
             model.load_state_dict(state_dict, strict=strict)
 
             logging.info(f"Done loading checkpoint")
@@ -382,11 +384,10 @@ class Lite(LightningLite):
         print(f"CoTracker param count (total): {sum(p.numel() for p in model.parameters())}")
 
         model, optimizer = self.setup(model, optimizer, move_to_device=False)
-        # model.cuda()
         model.train()
 
         save_freq = args.save_freq
-        scaler = GradScaler(enabled=args.mixed_precision)
+        scaler = GradScaler(enabled=False)
 
         should_keep_training = True
         global_batch_num = 0
@@ -399,9 +400,10 @@ class Lite(LightningLite):
                 if not all(gotit):
                     print("batch is None")
                     continue
+
                 dataclass_to_cuda_(batch)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
                 assert model.training
 
@@ -423,8 +425,9 @@ class Lite(LightningLite):
                     if total_steps % save_freq == save_freq - 1:
                         visualizer.visualize(
                             video=batch.video.clone(),
-                            tracks=batch.trajectory.clone(),
-                            filename="train_gt_traj",
+                            tracks=batch.trajectory.clone()[..., :2],
+                            visibility=batch.visibility.clone(),
+                            filename="train_gt_traj_0",
                             writer=logger.writer,
                             step=total_steps,
                         )
@@ -432,24 +435,26 @@ class Lite(LightningLite):
                         visualizer.visualize(
                             video=batch.video.clone(),
                             tracks=output["flow"]["predictions"][None],
-                            filename="train_pred_traj",
+                            visibility=output["visibility"]["predictions"][None] > 0.8,
+                            filename="train_pred_traj_0",
                             writer=logger.writer,
                             step=total_steps,
                         )
 
                     if len(output) > 1:
-                        logger.writer.add_scalar(f"live_total_loss", loss.item(), total_steps)
+                        logger.writer.add_scalar(
+                            f"live_total_loss", loss.item(), total_steps
+                        )
                     logger.writer.add_scalar(
                         f"learning_rate", optimizer.param_groups[0]["lr"], total_steps
                     )
                     global_batch_num += 1
 
                 self.barrier()
-
                 self.backward(scaler.scale(loss))
 
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
                 scaler.step(optimizer)
                 scheduler.step()
@@ -460,7 +465,9 @@ class Lite(LightningLite):
                         total_steps == 1 and args.validate_at_start
                     ):
                         if (epoch + 1) % args.save_every_n_epoch == 0:
-                            ckpt_iter = "0" * (6 - len(str(total_steps))) + str(total_steps)
+                            ckpt_iter = "0" * (6 - len(str(total_steps))) + str(
+                                total_steps
+                            )
                             save_path = Path(
                                 f"{args.ckpt_path}/model_{args.model_name}_{ckpt_iter}.pth"
                             )
@@ -484,6 +491,10 @@ class Lite(LightningLite):
                                 eval_dataloaders,
                                 logger.writer,
                                 total_steps,
+                                query_random=(
+                                    args.query_sampling_method is not None
+                                    and "random" in args.query_sampling_method
+                                ),
                             )
                             model.train()
                             torch.cuda.empty_cache()
@@ -492,12 +503,23 @@ class Lite(LightningLite):
                 if total_steps > args.num_steps:
                     should_keep_training = False
                     break
+
         if self.global_rank == 0:
             print("FINISHED TRAINING")
 
             PATH = f"{args.ckpt_path}/{args.model_name}_final.pth"
             torch.save(model.module.module.state_dict(), PATH)
-            run_test_eval(evaluator, model, eval_dataloaders, logger.writer, total_steps)
+            run_test_eval(
+                evaluator,
+                model,
+                final_dataloaders,
+                logger.writer,
+                total_steps,
+                query_random=(
+                    args.query_sampling_method is not None
+                    and "random" in args.query_sampling_method
+                ),
+            )
             logger.close()
 
 
@@ -505,18 +527,24 @@ if __name__ == "__main__":
     signal.signal(signal.SIGUSR1, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", default="cotracker", help="model name")
+    parser.add_argument("--model_name", default="cotracker_three", help="model name")
     parser.add_argument("--restore_ckpt", help="path to restore a checkpoint")
     parser.add_argument("--ckpt_path", help="path to save checkpoints")
     parser.add_argument(
         "--batch_size", type=int, default=4, help="batch size used during training."
     )
     parser.add_argument("--num_nodes", type=int, default=1)
-    parser.add_argument("--num_workers", type=int, default=10, help="number of dataloader workers")
+    parser.add_argument(
+        "--num_workers", type=int, default=10, help="number of dataloader workers"
+    )
 
-    parser.add_argument("--mixed_precision", action="store_true", help="use mixed precision")
+    parser.add_argument(
+        "--mixed_precision", action="store_true", help="use mixed precision"
+    )
     parser.add_argument("--lr", type=float, default=0.0005, help="max learning rate.")
-    parser.add_argument("--wdecay", type=float, default=0.00001, help="Weight decay in optimizer.")
+    parser.add_argument(
+        "--wdecay", type=float, default=0.00001, help="Weight decay in optimizer."
+    )
     parser.add_argument(
         "--num_steps", type=int, default=200000, help="length of training schedule."
     )
@@ -559,16 +587,23 @@ if __name__ == "__main__":
         default=4,
         help="number of updates to the disparity field in each forward pass.",
     )
-    parser.add_argument("--sequence_len", type=int, default=8, help="train sequence length")
+    parser.add_argument(
+        "--sequence_len", type=int, default=8, help="train sequence length"
+    )
     parser.add_argument(
         "--eval_datasets",
         nargs="+",
         default=["tapvid_davis_first"],
         help="what datasets to use for evaluation",
     )
-
     parser.add_argument(
-        "--remove_space_attn",
+        "--train_datasets",
+        nargs="+",
+        default=["kubric"],
+        help="what datasets to use for evaluation",
+    )
+    parser.add_argument(
+        "--random_frame_rate",
         action="store_true",
         help="remove space attention from CoTracker",
     )
@@ -584,20 +619,32 @@ if __name__ == "__main__":
         help="don't apply augmentations during training",
     )
     parser.add_argument(
-        "--sample_vis_1st_frame",
+        "--offline_model",
         action="store_true",
         help="only sample trajectories with points visible on the first frame",
     )
     parser.add_argument(
         "--sliding_window_len",
         type=int,
-        default=8,
+        default=16,
         help="length of the CoTracker sliding window",
     )
     parser.add_argument(
         "--model_stride",
         type=int,
-        default=8,
+        default=4,
+        help="stride of the CoTracker feature network",
+    )
+    parser.add_argument(
+        "--corr_radius",
+        type=int,
+        default=3,
+        help="stride of the CoTracker feature network",
+    )
+    parser.add_argument(
+        "--corr_levels",
+        type=int,
+        default=4,
         help="stride of the CoTracker feature network",
     )
     parser.add_argument(
@@ -613,6 +660,42 @@ if __name__ == "__main__":
         default=1000,
         help="maximum length of evaluation videos",
     )
+    parser.add_argument(
+        "--query_sampling_method",
+        type=str,
+        help="path lo all the datasets (train and eval)",
+    )
+    parser.add_argument(
+        "--random_number_traj",
+        action="store_true",
+        help="only sample trajectories with points visible on the first frame",
+    )
+    parser.add_argument(
+        "--add_huber_loss",
+        action="store_true",
+        help="only sample trajectories with points visible on the first frame",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="only sample trajectories with points visible on the first frame",
+    )
+    parser.add_argument(
+        "--random_seq_len",
+        action="store_true",
+        help="only sample trajectories with points visible on the first frame",
+    )
+    parser.add_argument(
+        "--linear_layer_for_vis_conf",
+        action="store_true",
+        help="stride of the CoTracker feature network",
+    )
+    parser.add_argument(
+        "--train_only_on_visible",
+        action="store_true",
+        help="stride of the CoTracker feature network",
+    )
+
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO,
@@ -626,6 +709,6 @@ if __name__ == "__main__":
         strategy=DDPStrategy(find_unused_parameters=False),
         devices="auto",
         accelerator="gpu",
-        precision=32,
+        precision="bf16" if args.mixed_precision else 32,
         num_nodes=args.num_nodes,
     ).run(args)

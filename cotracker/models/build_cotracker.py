@@ -7,7 +7,8 @@
 import torch
 
 from cotracker.models.core.cotracker.cotracker import CoTracker2
-from cotracker.models.core.ndtracker import NDTracker
+from cotracker.models.core.cotracker.cotracker3_offline import CoTrackerThreeOffline
+from cotracker.models.core.cotracker.cotracker3_online import CoTrackerThreeOnline
 
 
 def build_cotracker(
@@ -22,8 +23,18 @@ def build_cotracker(
         raise ValueError(f"Unknown model name {model_name}")
 
 
-def build_cotracker(checkpoint=None):
-    cotracker = CoTracker2(stride=4, window_len=16, add_space_attn=True)
+def build_cotracker(checkpoint=None, offline=True, window_len=16, v2=False):
+    if offline:
+        cotracker = CoTrackerThreeOffline(
+            stride=4, corr_radius=3, window_len=window_len
+        )
+    else:
+        if v2:
+            cotracker = CoTracker2(stride=4, window_len=window_len)
+        else:
+            cotracker = CoTrackerThreeOnline(
+                stride=4, corr_radius=3, window_len=window_len
+            )
 
     if checkpoint is not None:
         with open(checkpoint, "rb") as f:

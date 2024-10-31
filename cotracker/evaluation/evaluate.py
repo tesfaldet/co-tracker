@@ -6,24 +6,20 @@
 
 import json
 import os
-from dataclasses import dataclass, field
-
 import hydra
 import numpy as np
-
 import torch
+
+from typing import Optional
+from dataclasses import dataclass, field
+
 from omegaconf import OmegaConf
 
-from cotracker.datasets.tap_vid_datasets import TapVidDataset
-from cotracker.datasets.dr_dataset import DynamicReplicaDataset
 from cotracker.datasets.utils import collate_fn
-
 from cotracker.models.evaluation_predictor import EvaluationPredictor
 
 from cotracker.evaluation.core.evaluator import Evaluator
-from cotracker.models.build_cotracker import (
-    build_cotracker,
-)
+from cotracker.models.build_cotracker import build_cotracker
 
 from cotracker.models.core.ndtracker import NDTracker
 
@@ -51,14 +47,20 @@ class DefaultConfig:
     # The size (N) of the local support grid.
     # local_grid_size: int = 8
     local_grid_size: int = 0
+    num_uniformly_sampled_pts: int = 0
+    sift_size: int = 0
     # A flag indicating whether to evaluate one ground truth point at a time.
-    # single_point: bool = True
     single_point: bool = False
+    offline_model: bool = False
+    window_len: int = 16
     # The number of iterative updates for each sliding window.
     n_iters: int = 6
 
     seed: int = 0
     gpu_idx: int = 0
+    local_extent: int = 50
+
+    v2: bool = False
 
     # Override hydra's working directory to current working dir,
     # also disable storing the .hydra logs:
@@ -96,31 +98,39 @@ def run_eval(cfg: DefaultConfig):
     evaluator = Evaluator(cfg.exp_dir)
     # cotracker_model = build_cotracker(cfg.checkpoint)
 
-    cotracker_model = NDTracker(
-        encoder_stride=4,
-        encoder_dim=128,
-        encoder_ckpt=None,
-        finetune_encoder=False,
-        transformer_token_dim=256,
-        transformer_num_heads=8,
-        transformer_mlp_hidden_dim_mult=2,
-        transformer_depth=6,
+    # cotracker_model = NDTracker(
+    #     encoder_stride=4,
+    #     encoder_dim=128,
+    #     encoder_ckpt=None,
+    #     finetune_encoder=False,
+    #     transformer_token_dim=256,
+    #     transformer_num_heads=8,
+    #     transformer_mlp_hidden_dim_mult=2,
+    #     transformer_depth=6,
+    # )
+    # weights = torch.load("/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/ndtracker_rel_kub_step_200000_statedict.ckpt", map_location="cpu", weights_only=True)
+    # weights = {
+    #     k.removeprefix("tracker."): v for k, v in weights.items() if k.startswith("tracker.")
+    # }
+    # cotracker_model.load_state_dict(weights)
+    # cotracker_model.eval()
+    cotracker_model = build_cotracker(
+        cfg.checkpoint, offline=cfg.offline_model, window_len=cfg.window_len, v2=cfg.v2
     )
-    weights = torch.load("/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/ndtracker_rel_kub_step_200000_statedict.ckpt", map_location="cpu", weights_only=True)
-    weights = {
-        k.removeprefix("tracker."): v for k, v in weights.items() if k.startswith("tracker.")
-    }
-    cotracker_model.load_state_dict(weights)
-    cotracker_model.eval()
 
     # Creating the EvaluationPredictor object
     predictor = EvaluationPredictor(
         cotracker_model,
         grid_size=cfg.grid_size,
         local_grid_size=cfg.local_grid_size,
+        sift_size=cfg.sift_size,
         single_point=cfg.single_point,
+        num_uniformly_sampled_pts=cfg.num_uniformly_sampled_pts,
         n_iters=cfg.n_iters,
+        local_extent=cfg.local_extent,
+        interp_shape=(384, 512),
     )
+
     if torch.cuda.is_available():
         predictor.model = predictor.model.cuda()
 
@@ -131,28 +141,44 @@ def run_eval(cfg: DefaultConfig):
     # Constructing the specified dataset
     curr_collate_fn = collate_fn
     if "tapvid" in cfg.dataset_name:
+        from cotracker.datasets.tap_vid_datasets import TapVidDataset
+
         dataset_type = cfg.dataset_name.split("_")[1]
         if dataset_type == "davis":
             # data_root = os.path.join(cfg.dataset_root, "tapvid_davis", "tapvid_davis.pkl")
             data_root = "/home/mila/m/mattie.tesfaldet/scratch/Projects/diffusion-pips/datasets/tapvid_davis/tapvid_davis.pkl"
         elif dataset_type == "kinetics":
             data_root = os.path.join(
-                cfg.dataset_root, "/kinetics/kinetics-dataset/k700-2020/tapvid_kinetics"
+                cfg.dataset_root, "tapvid_davis", "tapvid_davis.pkl"
             )
+        elif dataset_type == "kinetics":
+            data_root = os.path.join(cfg.dataset_root, "tapvid_kinetics")
+        elif dataset_type == "robotap":
+            data_root = os.path.join(cfg.dataset_root, "tapvid_robotap")
+        elif dataset_type == "stacking":
+            data_root = os.path.join(
+                cfg.dataset_root, "tapvid_rgb_stacking", "tapvid_rgb_stacking.pkl"
+            )
+
         test_dataset = TapVidDataset(
             dataset_type=dataset_type,
             data_root=data_root,
             queried_first=not "strided" in cfg.dataset_name,
+            # resize_to=None,
         )
     elif cfg.dataset_name == "dynamic_replica":
-        test_dataset = DynamicReplicaDataset(sample_len=300, only_first_n_samples=1)
+        from cotracker.datasets.dr_dataset import DynamicReplicaDataset
+
+        test_dataset = DynamicReplicaDataset(
+            cfg.dataset_root, sample_len=300, only_first_n_samples=1
+        )
 
     # Creating the DataLoader object
     test_dataloader = torch.utils.data.DataLoader(
         test_dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=14,
+        num_workers=1,
         collate_fn=curr_collate_fn,
     )
 
@@ -161,9 +187,7 @@ def run_eval(cfg: DefaultConfig):
 
     start = time.time()
     evaluate_result = evaluator.evaluate_sequence(
-        predictor,
-        test_dataloader,
-        dataset_name=cfg.dataset_name,
+        predictor, test_dataloader, dataset_name=cfg.dataset_name
     )
     end = time.time()
     print(end - start)
