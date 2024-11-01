@@ -42,4 +42,5 @@ def build_cotracker(checkpoint=None, offline=True, window_len=16, v2=False):
             if "model" in state_dict:
                 state_dict = state_dict["model"]
         cotracker.load_state_dict(state_dict)
+        print(f"Loaded model from {checkpoint}")
     return cotracker

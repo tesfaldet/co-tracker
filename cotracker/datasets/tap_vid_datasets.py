@@ -65,11 +65,14 @@ def sample_queries_first(
         index = np.where(target_occluded[i] == 0)[0][0]
         x, y = target_points[i, index, 0], target_points[i, index, 1]
         query_points.append(np.array([index, y, x]))  # [t, y, x]
-    query_points = np.stack(query_points, axis=0)
+    if len(query_points) > 0:
+        query_points = np.stack(query_points, axis=0)
+    else:
+        query_points = False
 
     return {
         "video": frames[np.newaxis, ...],
-        "query_points": query_points[np.newaxis, ...],
+        "query_points": query_points[np.newaxis, ...] if query_points is not False else False,
         "target_points": target_points[np.newaxis, ...],
         "occluded": target_occluded[np.newaxis, ...],
     }
@@ -220,37 +223,45 @@ class TapVidDataset(torch.utils.data.Dataset):
         else:
             target_points *= np.array([frames.shape[2] - 1, frames.shape[1] - 1])
 
-        _, H, W, C = frames.shape
-        assert C == 3
-        assert H == 384
-        assert W == 512
-        target_points = target_points.clip(min=[-64, -64], max=[W + 63, H + 63], out=target_points)
-
         target_occ = self.points_dataset[video_name]["occluded"]
         if self.queried_first:
             converted = sample_queries_first(target_occ, target_points, frames)
         else:
             converted = sample_queries_strided(target_occ, target_points, frames)
-        assert converted["target_points"].shape[1] == converted["query_points"].shape[1]
+        if converted["query_points"] == False:
+            skip = True
+        else:
+            skip = False
 
-        trajs = (
-            torch.from_numpy(converted["target_points"])[0].permute(1, 0, 2).float()
-        )  # T, N, D
+        if not skip:
+            assert converted["target_points"].shape[1] == converted["query_points"].shape[1]
 
-        rgbs = torch.from_numpy(frames).permute(0, 3, 1, 2).float()
-        visibles = torch.logical_not(torch.from_numpy(converted["occluded"]))[
-            0
-        ].permute(
-            1, 0
-        )  # T, N
-        query_points = torch.from_numpy(converted["query_points"])[0]  # T, N
-        return CoTrackerData(
+            trajs = (
+                torch.from_numpy(converted["target_points"])[0].permute(1, 0, 2).float()
+            )  # T, N, D
+
+            rgbs = torch.from_numpy(frames).permute(0, 3, 1, 2).float()
+            visibles = torch.logical_not(torch.from_numpy(converted["occluded"]))[
+                0
+            ].permute(
+                1, 0
+            )  # T, N
+            query_points = torch.from_numpy(converted["query_points"])[0]  # T, N
+            gotit = True
+        else:
+            trajs = torch.zeros((1, 1, 2))
+            rgbs = torch.from_numpy(frames).permute(0, 3, 1, 2).float()
+            visibles = torch.zeros((1, 1))
+            query_points = torch.zeros((1, 3))
+            gotit = False
+        print(f"{video_name} {trajs.shape}")
+        return (CoTrackerData(
             rgbs,
             trajs,
             visibles,
             seq_name=str(video_name),
             query_points=query_points,
-        )
+        ), gotit)
 
     def __len__(self):
         return len(self.points_dataset)

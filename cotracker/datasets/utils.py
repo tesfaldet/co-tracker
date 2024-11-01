@@ -43,15 +43,16 @@ def collate_fn(batch):
     if batch[0].segmentation is not None:
         segmentation = torch.stack([b.segmentation for b in batch], dim=0)
     seq_name = [b.seq_name for b in batch]
+    gotit = [gotit for _, gotit in batch]
 
-    return CoTrackerData(
+    return (CoTrackerData(
         video=video,
         trajectory=trajectory,
         visibility=visibility,
         segmentation=segmentation,
         seq_name=seq_name,
         query_points=query_points,
-    )
+    ), gotit)
 
 
 def collate_fn_train(batch):

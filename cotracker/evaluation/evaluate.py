@@ -23,7 +23,10 @@ from cotracker.models.build_cotracker import build_cotracker
 
 from cotracker.models.core.ndtracker import NDTracker
 
-# python ./cotracker/evaluation/evaluate.py --config-name eval_tapvid_davis_first exp_dir=./eval_outputs dataset_root=your/tapvid/path hydra.mode=RunMode.RUN
+# python ./cotracker/evaluation/evaluate.py --config-name eval_tapvid_davis_first exp_dir=./eval_outputs hydra.mode=RunMode.RUN
+# python ./cotracker/evaluation/evaluate.py --config-name eval_tapvid_kinetics_first exp_dir=./eval_outputs hydra.mode=RunMode.RUN
+# python ./cotracker/evaluation/evaluate.py --config-name eval_tapvid_stacking_first exp_dir=./eval_outputs hydra.mode=RunMode.RUN
+# python ./cotracker/evaluation/evaluate.py --config-name eval_tapvid_robotap_first exp_dir=./eval_outputs hydra.mode=RunMode.RUN
 
 @dataclass(eq=False)
 class DefaultConfig:
@@ -37,7 +40,8 @@ class DefaultConfig:
 
     # Path to the pre-trained model checkpoint to be used for the evaluation.
     # The default value is the path to a specific CoTracker model checkpoint.
-    checkpoint: str = "/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/cotracker_final.pth"
+    checkpoint: str = "/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/scaled_online.pth"
+    # checkpoint: str = "/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/cotracker2v1.pth"
 
     # EvaluationPredictor parameters
     # The size (N) of the support grid used in the predictor.
@@ -61,6 +65,7 @@ class DefaultConfig:
     local_extent: int = 50
 
     v2: bool = False
+    # v2: bool = True
 
     # Override hydra's working directory to current working dir,
     # also disable storing the .hydra logs:
@@ -148,23 +153,22 @@ def run_eval(cfg: DefaultConfig):
             # data_root = os.path.join(cfg.dataset_root, "tapvid_davis", "tapvid_davis.pkl")
             data_root = "/home/mila/m/mattie.tesfaldet/scratch/Projects/diffusion-pips/datasets/tapvid_davis/tapvid_davis.pkl"
         elif dataset_type == "kinetics":
-            data_root = os.path.join(
-                cfg.dataset_root, "tapvid_davis", "tapvid_davis.pkl"
-            )
-        elif dataset_type == "kinetics":
-            data_root = os.path.join(cfg.dataset_root, "tapvid_kinetics")
+            data_root = "/home/mila/m/mattie.tesfaldet/scratch/Projects/diffusion-pips/datasets/tapvid_kinetics"
+            # data_root = os.path.join(cfg.dataset_root, "tapvid_kinetics")
         elif dataset_type == "robotap":
-            data_root = os.path.join(cfg.dataset_root, "tapvid_robotap")
+            data_root = "/home/mila/m/mattie.tesfaldet/scratch/Projects/diffusion-pips/datasets/tapvid_robotap"
+            # data_root = os.path.join(cfg.dataset_root, "tapvid_robotap")
         elif dataset_type == "stacking":
-            data_root = os.path.join(
-                cfg.dataset_root, "tapvid_rgb_stacking", "tapvid_rgb_stacking.pkl"
-            )
+            data_root = "/home/mila/m/mattie.tesfaldet/scratch/Projects/diffusion-pips/datasets/tapvid_rgb_stacking/tapvid_rgb_stacking.pkl"
+            # data_root = os.path.join(
+            #     cfg.dataset_root, "tapvid_rgb_stacking", "tapvid_rgb_stacking.pkl"
+            # )
 
         test_dataset = TapVidDataset(
             dataset_type=dataset_type,
             data_root=data_root,
             queried_first=not "strided" in cfg.dataset_name,
-            # resize_to=None,
+            resize_to=[384, 512],
         )
     elif cfg.dataset_name == "dynamic_replica":
         from cotracker.datasets.dr_dataset import DynamicReplicaDataset
