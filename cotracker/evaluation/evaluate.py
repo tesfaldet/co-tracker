@@ -21,12 +21,19 @@ from cotracker.models.evaluation_predictor import EvaluationPredictor
 from cotracker.evaluation.core.evaluator import Evaluator
 from cotracker.models.build_cotracker import build_cotracker
 
-from cotracker.models.core.ndtracker import NDTracker
 
 # python ./cotracker/evaluation/evaluate.py --config-name eval_tapvid_davis_first exp_dir=./eval_outputs hydra.mode=RunMode.RUN
+
 # python ./cotracker/evaluation/evaluate.py --config-name eval_tapvid_kinetics_first exp_dir=./eval_outputs hydra.mode=RunMode.RUN
+
 # python ./cotracker/evaluation/evaluate.py --config-name eval_tapvid_stacking_first exp_dir=./eval_outputs hydra.mode=RunMode.RUN
+
 # python ./cotracker/evaluation/evaluate.py --config-name eval_tapvid_robotap_first exp_dir=./eval_outputs hydra.mode=RunMode.RUN
+
+# python ./cotracker/evaluation/evaluate.py --config-name eval_pod_first exp_dir=./eval_outputs hydra.mode=RunMode.RUN
+
+# python ./cotracker/evaluation/evaluate.py --config-name eval_dynamic_replica exp_dir=./eval_outputs hydra.mode=RunMode.RUN
+
 
 @dataclass(eq=False)
 class DefaultConfig:
@@ -40,8 +47,13 @@ class DefaultConfig:
 
     # Path to the pre-trained model checkpoint to be used for the evaluation.
     # The default value is the path to a specific CoTracker model checkpoint.
-    checkpoint: str = "/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/scaled_online.pth"
-    # checkpoint: str = "/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/cotracker2v1.pth"
+    # checkpoint: str = "/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/baseline_online.pth"  # CoTracker3 Kub
+    checkpoint: str = "/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/scaled_online.pth"  # CoTracker3 Kub+15k
+    # checkpoint: str = "/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/cotracker2v1.pth"  # CoTracker2.1
+    # checkpoint: str = "/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/model_cotracker_three_400000_pod.pth"  # CoTracker3 POD (400k, batch size 4)
+
+    # checkpoint: str = "/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/model_cotracker_three_400000_ct3kub.pth"
+    # CoTracker3 CT3-Kub (400k, batch size 4)
 
     # EvaluationPredictor parameters
     # The size (N) of the support grid used in the predictor.
@@ -62,10 +74,15 @@ class DefaultConfig:
 
     seed: int = 0
     gpu_idx: int = 0
-    local_extent: int = 50
+    local_extent: int = 50  # Only used if single_point = True
 
     v2: bool = False
     # v2: bool = True
+
+    occluder_direction: Optional[str] = None  # Only for TapVid datasets
+    num_samples: int = 1  # Best-of-N / Worst-of-N
+    worst_of_n: bool = False  # Whether to do worst-of-N instead of best-of-N
+    use_oracle: bool = True  # Whether to use oracle information for best/worst-of-N
 
     # Override hydra's working directory to current working dir,
     # also disable storing the .hydra logs:
@@ -101,24 +118,6 @@ def run_eval(cfg: DefaultConfig):
         OmegaConf.save(config=cfg, f=f)
 
     evaluator = Evaluator(cfg.exp_dir)
-    # cotracker_model = build_cotracker(cfg.checkpoint)
-
-    # cotracker_model = NDTracker(
-    #     encoder_stride=4,
-    #     encoder_dim=128,
-    #     encoder_ckpt=None,
-    #     finetune_encoder=False,
-    #     transformer_token_dim=256,
-    #     transformer_num_heads=8,
-    #     transformer_mlp_hidden_dim_mult=2,
-    #     transformer_depth=6,
-    # )
-    # weights = torch.load("/home/mila/m/mattie.tesfaldet/Projects/co-tracker/checkpoints/ndtracker_rel_kub_step_200000_statedict.ckpt", map_location="cpu", weights_only=True)
-    # weights = {
-    #     k.removeprefix("tracker."): v for k, v in weights.items() if k.startswith("tracker.")
-    # }
-    # cotracker_model.load_state_dict(weights)
-    # cotracker_model.eval()
     cotracker_model = build_cotracker(
         cfg.checkpoint, offline=cfg.offline_model, window_len=cfg.window_len, v2=cfg.v2
     )
@@ -151,15 +150,19 @@ def run_eval(cfg: DefaultConfig):
         dataset_type = cfg.dataset_name.split("_")[1]
         if dataset_type == "davis":
             # data_root = os.path.join(cfg.dataset_root, "tapvid_davis", "tapvid_davis.pkl")
-            data_root = "/home/mila/m/mattie.tesfaldet/scratch/Projects/diffusion-pips/datasets/tapvid_davis/tapvid_davis.pkl"
+            data_root = "/network/datasets/tapvid.var/tapvid_extract/data/tapvid_davis/tapvid_davis.pkl"
         elif dataset_type == "kinetics":
-            data_root = "/home/mila/m/mattie.tesfaldet/scratch/Projects/diffusion-pips/datasets/tapvid_kinetics"
+            data_root = (
+                "/network/datasets/tapvid.var/tapvid_extract/data/tapvid_kinetics"
+            )
             # data_root = os.path.join(cfg.dataset_root, "tapvid_kinetics")
         elif dataset_type == "robotap":
-            data_root = "/home/mila/m/mattie.tesfaldet/scratch/Projects/diffusion-pips/datasets/tapvid_robotap"
+            data_root = (
+                "/network/datasets/tapvid.var/tapvid_extract/data/tapvid_robotap"
+            )
             # data_root = os.path.join(cfg.dataset_root, "tapvid_robotap")
         elif dataset_type == "stacking":
-            data_root = "/home/mila/m/mattie.tesfaldet/scratch/Projects/diffusion-pips/datasets/tapvid_rgb_stacking/tapvid_rgb_stacking.pkl"
+            data_root = "/network/datasets/tapvid.var/tapvid_extract/data/tapvid_rgb_stacking/tapvid_rgb_stacking.pkl"
             # data_root = os.path.join(
             #     cfg.dataset_root, "tapvid_rgb_stacking", "tapvid_rgb_stacking.pkl"
             # )
@@ -169,12 +172,29 @@ def run_eval(cfg: DefaultConfig):
             data_root=data_root,
             queried_first=not "strided" in cfg.dataset_name,
             resize_to=[384, 512],
+            occluder_direction=cfg.occluder_direction,
         )
     elif cfg.dataset_name == "dynamic_replica":
         from cotracker.datasets.dr_dataset import DynamicReplicaDataset
 
         test_dataset = DynamicReplicaDataset(
-            cfg.dataset_root, sample_len=300, only_first_n_samples=1
+            "/network/datasets/dynamicreplica.var/dynamicreplica_valid/data",
+            split="valid",
+            traj_per_sample=256,
+            resize_size=[384, 512],
+            sample_len=300,
+            only_first_n_samples=1,
+        )
+    elif cfg.dataset_name == "pointodyssey":
+        from cotracker.datasets.pointodyssey_dataset import PointOdyssey
+
+        test_dataset = PointOdyssey(
+            "/network/datasets/pointodyssey.var/pointodyssey_v1.4_extract/v1.4/pointodyssey_v1.4",
+            split="test",
+            num_trajectories=256,
+            first_n_frames=300,
+            load_rgbs=True,
+            resize_size=(384, 512),
         )
 
     # Creating the DataLoader object
@@ -191,7 +211,12 @@ def run_eval(cfg: DefaultConfig):
 
     start = time.time()
     evaluate_result = evaluator.evaluate_sequence(
-        predictor, test_dataloader, dataset_name=cfg.dataset_name
+        predictor,
+        test_dataloader,
+        dataset_name=cfg.dataset_name,  # visualize_every=1,
+        num_samples=cfg.num_samples,
+        worst_of_n=cfg.worst_of_n,
+        use_oracle=cfg.use_oracle,
     )
     end = time.time()
     print(end - start)

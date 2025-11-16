@@ -34,21 +34,34 @@ def collate_fn(batch):
     """
     Collate function for video tracks data.
     """
-    video = torch.stack([b.video for b in batch], dim=0)
-    trajectory = torch.stack([b.trajectory for b in batch], dim=0)
-    visibility = torch.stack([b.visibility for b in batch], dim=0)
-    query_points = segmentation = None
-    if batch[0].query_points is not None:
-        query_points = torch.stack([b.query_points for b in batch], dim=0)
-    if batch[0].segmentation is not None:
-        segmentation = torch.stack([b.segmentation for b in batch], dim=0)
-    seq_name = [b.seq_name for b in batch]
+    # video = torch.stack([b.video for b in batch], dim=0)
+    # trajectory = torch.stack([b.trajectory for b in batch], dim=0)
+    # visibility = torch.stack([b.visibility for b in batch], dim=0)
+    # query_points = segmentation = None
+    # if batch[0].query_points is not None:
+    #     query_points = torch.stack([b.query_points for b in batch], dim=0)
+    # if batch[0].segmentation is not None:
+    #     segmentation = torch.stack([b.segmentation for b in batch], dim=0)
+    # seq_name = [b.seq_name for b in batch]
+
     gotit = [gotit for _, gotit in batch]
+    video = torch.stack([b.video for b, _ in batch], dim=0)
+    trajectory = torch.stack([b.trajectory for b, _ in batch], dim=0)
+    visibility = torch.stack([b.visibility for b, _ in batch], dim=0)
+    seq_name = [b.seq_name for b, _ in batch]
+    query_points = segmentation = valid = None
+    if batch[0][0].query_points is not None:
+        query_points = torch.stack([b.query_points for b, _ in batch], dim=0)
+    if batch[0][0].segmentation is not None:
+        segmentation = torch.stack([b.segmentation for b, _ in batch], dim=0)
+    if batch[0][0].valid is not None:
+        valid = torch.stack([b.valid for b, _ in batch], dim=0)
 
     return (CoTrackerData(
         video=video,
         trajectory=trajectory,
         visibility=visibility,
+        valid=valid,
         segmentation=segmentation,
         seq_name=seq_name,
         query_points=query_points,

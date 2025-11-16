@@ -31,6 +31,7 @@ def sample_queries_first(
     target_occluded: np.ndarray,
     target_points: np.ndarray,
     frames: np.ndarray,
+    occluder_direction: str | None = None,
 ) -> Mapping[str, np.ndarray]:
     """Package a set of frames and tracks for use in TAPNet evaluations.
     Given a set of frames and tracks with no query points, use the first
@@ -60,6 +61,25 @@ def sample_queries_first(
     target_points = target_points[vis_f0_inds]
     target_occluded = target_occluded[vis_f0_inds]
 
+    # Occluded points in TAPVid test sets don't contain coord information, so we set occluded points as invalid.
+    target_valids = np.logical_not(target_occluded.copy())
+
+    if occluder_direction is not None:
+        assert occluder_direction in ["lr", "rl", "tb", "bt"], (
+            f"Invalid occlusion direction: {occluder_direction}"
+        )
+        # Sweep occlusion across the video.
+        frames, target_points, target_occluded = _sweep_occlusion(
+            frames, target_points, target_occluded, occluder_direction
+        )
+
+        # Remove trajectories that are not visible in the first frame (after sweeping occlusion).
+        visibles = np.logical_not(target_occluded)
+        vis_f0_inds = visibles[:, 0]
+        target_points = target_points[vis_f0_inds]
+        target_occluded = target_occluded[vis_f0_inds]
+        target_valids = target_valids[vis_f0_inds]
+
     query_points = []
     for i in range(target_points.shape[0]):
         index = np.where(target_occluded[i] == 0)[0][0]
@@ -67,15 +87,67 @@ def sample_queries_first(
         query_points.append(np.array([index, y, x]))  # [t, y, x]
     if len(query_points) > 0:
         query_points = np.stack(query_points, axis=0)
+        query_points = query_points[np.newaxis, ...]
+        gotit = True
     else:
-        query_points = False
+        gotit = False
 
     return {
         "video": frames[np.newaxis, ...],
-        "query_points": query_points[np.newaxis, ...] if query_points is not False else False,
+        "query_points": query_points,
         "target_points": target_points[np.newaxis, ...],
         "occluded": target_occluded[np.newaxis, ...],
+        "valids": target_valids[np.newaxis, ...],
+        "gotit": gotit,
     }
+
+
+def _sweep_occlusion(rgbs, trajs, occ, direction: str = "lr"):
+    """Sweeping occlusion.
+
+    Depending on the requested direction, a vertical or horizontal bar will sweep across the image sequence,
+    occluding points that fall behind it.
+
+    :param rgbs: The image sequence to apply the occlusion to.
+    :param trajs: The trajectory points for the image sequence.
+    :param occ: The occlusion status of each target point.
+    :param direction: The direction of the occlusion. Can be either "lr" (left-to-right), "rl" (right-to-left),
+    "tb" (top-to-bottom), or "bt" (bottom-to-top). Default is "lr".
+
+    :return: The image sequence with occlusions applied, and the corresponding trajectory points and visibility.
+    """
+    N, S, _ = trajs.shape
+    H, W = rgbs[0].shape[:2]
+    delta = 50  # Half-width of the occlusion bar in px.
+
+    if direction not in ["lr", "rl", "tb", "bt"]:
+        raise ValueError(f"Invalid occlusion direction: {direction}")
+
+    for i in range(S):
+        if direction in ["lr", "rl"]:
+            if direction == "lr":
+                xc = i / (S - 1) * W
+            elif direction == "rl":
+                xc = W - i / (S - 1) * W
+            x0 = np.clip(xc - delta / 2, 0, W - 1).round().astype(np.int32)
+            x1 = np.clip(xc + delta / 2, 0, W - 1).round().astype(np.int32)
+            rgbs[i][:, x0:x1, :] = 0
+
+            occ_inds = np.logical_and(trajs[:, i, 0] >= x0, trajs[:, i, 0] < x1)
+            occ[occ_inds, i] = 1
+        elif direction in ["tb", "bt"]:
+            if direction == "tb":
+                yc = i / (S - 1) * H
+            elif direction == "bt":
+                yc = H - i / (S - 1) * H
+            y0 = np.clip(yc - delta / 2, 0, H - 1).round().astype(np.int32)
+            y1 = np.clip(yc + delta / 2, 0, H - 1).round().astype(np.int32)
+            rgbs[i][y0:y1, :, :] = 0
+
+            occ_inds = np.logical_and(trajs[:, i, 1] >= y0, trajs[:, i, 1] < y1)
+            occ[occ_inds, i] = 1
+
+    return rgbs, trajs, occ
 
 
 def sample_queries_strided(
@@ -150,6 +222,7 @@ class TapVidDataset(torch.utils.data.Dataset):
         resize_to=[256, 256],
         queried_first=True,
         fast_eval=False,
+        occluder_direction=None,
     ):
         local_random = random.Random()
         local_random.seed(42)
@@ -157,6 +230,7 @@ class TapVidDataset(torch.utils.data.Dataset):
         self.dataset_type = dataset_type
         self.resize_to = resize_to
         self.queried_first = queried_first
+        self.occluder_direction = occluder_direction
         if self.dataset_type == "kinetics":
             all_paths = glob.glob(os.path.join(data_root, "*_of_0010.pkl"))
             points_dataset = []
@@ -225,43 +299,49 @@ class TapVidDataset(torch.utils.data.Dataset):
 
         target_occ = self.points_dataset[video_name]["occluded"]
         if self.queried_first:
-            converted = sample_queries_first(target_occ, target_points, frames)
+            converted = sample_queries_first(
+                target_occ, target_points, frames, self.occluder_direction
+            )
         else:
             converted = sample_queries_strided(target_occ, target_points, frames)
-        if converted["query_points"] == False:
+        if converted["gotit"] == False:
             skip = True
         else:
             skip = False
 
         if not skip:
-            assert converted["target_points"].shape[1] == converted["query_points"].shape[1]
+            assert (
+                converted["target_points"].shape[1]
+                == converted["query_points"].shape[1]
+            )
 
             trajs = (
                 torch.from_numpy(converted["target_points"])[0].permute(1, 0, 2).float()
             )  # T, N, D
 
-            rgbs = torch.from_numpy(frames).permute(0, 3, 1, 2).float()
+            rgbs = torch.from_numpy(frames).permute(0, 3, 1, 2).float()  # T, C, H, W
             visibles = torch.logical_not(torch.from_numpy(converted["occluded"]))[
                 0
-            ].permute(
-                1, 0
-            )  # T, N
+            ].permute(1, 0)  # T, N
+            valids = torch.from_numpy(converted["valids"])[0].permute(1, 0)  # T, N
             query_points = torch.from_numpy(converted["query_points"])[0]  # T, N
             gotit = True
         else:
             trajs = torch.zeros((1, 1, 2))
             rgbs = torch.from_numpy(frames).permute(0, 3, 1, 2).float()
             visibles = torch.zeros((1, 1))
+            valids = visibles.clone()
             query_points = torch.zeros((1, 3))
             gotit = False
         print(f"{video_name} {trajs.shape}")
-        return (CoTrackerData(
+        return CoTrackerData(
             rgbs,
             trajs,
             visibles,
+            valid=valids,
             seq_name=str(video_name),
             query_points=query_points,
-        ), gotit)
+        ), gotit
 
     def __len__(self):
         return len(self.points_dataset)

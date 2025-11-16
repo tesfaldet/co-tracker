@@ -162,10 +162,10 @@ class CoTrackerPredictor(torch.nn.Module):
                 video, queries, tracks, visibilities
             )
             if add_support_grid:
-                queries[:, -self.support_grid_size**2 :, 0] = T - 1
+                queries[:, -(self.support_grid_size**2) :, 0] = T - 1
         if add_support_grid:
-            tracks = tracks[:, :, : -self.support_grid_size**2]
-            visibilities = visibilities[:, :, : -self.support_grid_size**2]
+            tracks = tracks[:, :, : -(self.support_grid_size**2)]
+            visibilities = visibilities[:, :, : -(self.support_grid_size**2)]
         thr = 0.9
         visibilities = visibilities > thr
 
@@ -233,6 +233,7 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
         grid_size: int = 5,
         grid_query_frame: int = 0,
         add_support_grid=False,
+        iters: int = 6,
     ):
         B, T, C, H, W = video_chunk.shape
         # Initialize online video processing and save queried points
@@ -252,7 +253,9 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
                 )
                 if add_support_grid:
                     grid_pts = get_points_on_a_grid(
-                        self.support_grid_size, self.interp_shape, device=video_chunk.device
+                        self.support_grid_size,
+                        self.interp_shape,
+                        device=video_chunk.device,
                     )
                     grid_pts = torch.cat(
                         [torch.zeros_like(grid_pts[:, :, :1]), grid_pts], dim=2
@@ -267,7 +270,7 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
                     [torch.ones_like(grid_pts[:, :, :1]) * grid_query_frame, grid_pts],
                     dim=2,
                 )
-            
+
             self.queries = queries
             return (None, None)
 
@@ -280,13 +283,13 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
         )
 
         tracks, visibilities, confidence, __ = self.model(
-            video=video_chunk, queries=self.queries, iters=6, is_online=True
+            video=video_chunk, queries=self.queries, iters=iters, is_online=True
         )
         if add_support_grid:
-            tracks = tracks[:,:,:self.N]
-            visibilities = visibilities[:,:,:self.N]
-            confidence = confidence[:,:,:self.N]
-            
+            tracks = tracks[:, :, : self.N]
+            visibilities = visibilities[:, :, : self.N]
+            confidence = confidence[:, :, : self.N]
+
         visibilities = visibilities * confidence
         thr = 0.6
         return (
@@ -298,4 +301,5 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
                 ]
             ),
             visibilities > thr,
+            confidence,  # NOTE: Comment out if not using best-of-N / worst-of-N
         )

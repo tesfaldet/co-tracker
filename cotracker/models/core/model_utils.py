@@ -62,6 +62,7 @@ def get_sift_sampled_pts(
     sampling_length_percent: float = 0.25,
 ):
     import cv2
+
     # assert size == 384, "hardcoded for experiment"
     sift = cv2.SIFT_create(nfeatures=size // num_sampled_frames)
     points = list()
@@ -186,6 +187,45 @@ def reduce_masked_mean(input, mask, dim=None, keepdim=False):
 
     mean = numer / (EPS + denom)
     return mean
+
+
+def reduce_masked_median(
+    input: torch.Tensor,
+    mask: torch.Tensor,
+    dim: Optional[int] = None,
+    keepdim: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute the median of tensor `input` along `dim`, ignoring values where `mask` is `False`. `input` and `mask`
+    need to be broadcastable.
+
+    :param input: The tensor to compute the median of.
+    :param mask: A tensor with the same shape as `input` with `True` where `input` is valid and `False` where `input`
+        should be masked. The mask should not be all `False` along `dim` to avoid NaNs from zero division.
+    :param dim: Dimension to take median of. Defaults to `None`.
+    :param keepdim: If `True`, keep the dimension where the median is performed over. Defaults to `False`.
+
+    :raises ValueError: If `input` and `mask` do not have the same shape.
+
+    :return: A tuple containing a tensor representing the median of `input` with the same shape as `input`, except
+    dimension `dim` reduced if `keepdim=True`, and another tensor representing the mask of nan values in the median.
+    """
+    if input.shape != mask.shape:
+        raise ValueError("input and mask must have the same shape")
+
+    if dim is None:
+        if torch.sum(mask) > 0:
+            median = torch.median(input[mask > 0])
+        else:
+            median = torch.tensor(torch.nan, device=input.device)
+    else:
+        # assert (
+        #     mask.sum(dim=dim).ne(0).all()
+        # ), "mask should not be all False along the chosen dim(s), causes zero division."
+
+        input_nan = input.float().masked_fill(~mask.bool(), torch.nan)
+        median, _ = input_nan.nanmedian(dim=dim, keepdim=keepdim)
+
+    return median, median.isnan()
 
 
 def bilinear_sampler(input, coords, align_corners=True, padding_mode="border"):

@@ -77,7 +77,7 @@ class EvaluationPredictor(torch.nn.Module):
                 t = query[0, 0, 0].long()
                 start_ind = 0
                 traj_e_pind, vis_e_pind, conf_e_pind = self._process_one_point(
-                    video[:,start_ind:], query
+                    video[:, start_ind:], query
                 )
                 traj_e[:, start_ind:, pind : pind + 1] = traj_e_pind[:, :, :1]
                 vis_e[:, start_ind:, pind : pind + 1] = vis_e_pind[:, :, :1]
@@ -120,18 +120,18 @@ class EvaluationPredictor(torch.nn.Module):
                 traj_e = traj_e[
                     :,
                     :,
-                    : -self.grid_size**2 - sift_size - self.num_uniformly_sampled_pts,
+                    : -(self.grid_size**2) - sift_size - self.num_uniformly_sampled_pts,
                 ]
                 vis_e = vis_e[
                     :,
                     :,
-                    : -self.grid_size**2 - sift_size - self.num_uniformly_sampled_pts,
+                    : -(self.grid_size**2) - sift_size - self.num_uniformly_sampled_pts,
                 ]
                 if conf_e is not None:
                     conf_e = conf_e[
                         :,
                         :,
-                        : -self.grid_size**2
+                        : -(self.grid_size**2)
                         - sift_size
                         - self.num_uniformly_sampled_pts,
                     ]
@@ -156,9 +156,7 @@ class EvaluationPredictor(torch.nn.Module):
 
             xy_target = torch.cat(
                 [torch.zeros_like(xy_target[:, :, :1]), xy_target], dim=2
-            ).to(
-                device
-            )  #
+            ).to(device)  #
             query = torch.cat([query, xy_target], dim=1)  #
 
         if self.grid_size > 0:

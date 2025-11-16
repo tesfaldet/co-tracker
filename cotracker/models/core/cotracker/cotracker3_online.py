@@ -111,7 +111,6 @@ class CoTrackerThreeBase(nn.Module):
             return coords_lvl
 
     def get_track_feat(self, fmaps, queried_frames, queried_coords, support_radius=0):
-
         sample_frames = queried_frames[:, None, :, None]
         sample_coords = torch.cat(
             [
@@ -186,7 +185,7 @@ class CoTrackerThreeOnline(CoTrackerThreeBase):
         coord_preds, vis_preds, conf_preds = [], [], []
         for it in range(iters):
             coords = coords.detach()  # B T N 2
-            coords_init = coords.view(B * S, N, 2)
+            coords_init = coords.reshape(B * S, N, 2)
             corr_embs = []
             corr_feats = []
             for i in range(self.corr_levels):
@@ -310,9 +309,9 @@ class CoTrackerThreeOnline(CoTrackerThreeBase):
         assert S >= 2  # A tracker needs at least two frames to track something
         if is_online:
             assert T <= S, "Online mode: video chunk must be <= window size."
-            assert (
-                self.online_ind is not None
-            ), "Call model.init_video_online_processing() first."
+            assert self.online_ind is not None, (
+                "Call model.init_video_online_processing() first."
+            )
             assert not is_train, "Training not supported in online mode."
 
         step = S // 2  # How much the sliding window moves at every step
@@ -448,10 +447,23 @@ class CoTrackerThreeOnline(CoTrackerThreeBase):
         vis_init = torch.zeros((B, S, N, 1), device=device).float()
         conf_init = torch.zeros((B, S, N, 1), device=device).float()
         coords_init = queried_coords.reshape(B, 1, N, 2).expand(B, S, N, 2).float()
+        # NOTE: Uncomment to add noise to the initialization in first window (to query points)
+        vis_init = vis_init + torch.randn(B, S, N, 1, device=device)
+        conf_init = conf_init + torch.randn(B, S, N, 1, device=device)
+        coords_init = (
+            coords_init
+            + (
+                ((torch.randn(B, S, N, 2, device=device) + 1.0) / 2.0)
+                * torch.tensor([W / self.stride, H / self.stride], device=device)
+            )
+            * 0.25
+        )
 
         num_windows = (T - S + step - 1) // step + 1
         # We process only the current video chunk in the online mode
         indices = [self.online_ind] if is_online else range(0, step * num_windows, step)
+        self.cur_frame = self.online_ind if is_online else 0
+        self.end_frame = self.online_ind + S if is_online else T
 
         for ind in indices:
             if ind > 0:
@@ -461,15 +473,38 @@ class CoTrackerThreeOnline(CoTrackerThreeBase):
                 ]  # B 1 N 1
                 coords_prev = coords_predicted[:, ind : ind + overlap] / self.stride
                 padding_tensor = coords_prev[:, -1:, :, :].expand(-1, step, -1, -1)
+                # NOTE: Uncomment to add noise to initialization when past first window (to last point of previous predictions)
+                padding_tensor = (
+                    padding_tensor
+                    + (
+                        ((torch.randn(B, step, N, 2, device=device) + 1.0) / 2.0)
+                        * torch.tensor(
+                            [W / self.stride, H / self.stride], device=device
+                        )
+                    )
+                    * 0.25
+                )
                 coords_prev = torch.cat([coords_prev, padding_tensor], dim=1)
 
                 vis_prev = vis_predicted[:, ind : ind + overlap, :, None].clone()
                 padding_tensor = vis_prev[:, -1:, :, :].expand(-1, step, -1, -1)
+                # NOTE: Uncomment to add noise to initialization when past first window (to last point of previous predictions)
+                padding_tensor = padding_tensor + torch.randn(
+                    B, step, N, 1, device=device
+                )
                 vis_prev = torch.cat([vis_prev, padding_tensor], dim=1)
 
                 conf_prev = conf_predicted[:, ind : ind + overlap, :, None].clone()
                 padding_tensor = conf_prev[:, -1:, :, :].expand(-1, step, -1, -1)
+                # NOTE: Uncomment to add noise to initialization when past first window (to last point of previous predictions)
+                padding_tensor = padding_tensor + torch.randn(
+                    B, step, N, 1, device=device
+                )
                 conf_prev = torch.cat([conf_prev, padding_tensor], dim=1)
+
+                # _vis_init = torch.zeros((B, S, N, 1), device=device).float() + torch.randn(B, S, N, 1, device=device)
+                # _conf_init = torch.zeros((B, S, N, 1), device=device).float() + torch.randn(B, S, N, 1, device=device)
+                # _coords_init = queried_coords.reshape(B, 1, N, 2).expand(B, S, N, 2).float() + (((torch.randn(B, S, N, 2, device=device) * 0.25 + 1.0) / 2.0) * torch.tensor([W / self.stride, H / self.stride], device=device))
 
                 coords_init = torch.where(
                     copy_over.expand_as(coords_init), coords_prev, coords_init
@@ -483,6 +518,7 @@ class CoTrackerThreeOnline(CoTrackerThreeBase):
 
             attention_mask = (queried_frames < ind + S).reshape(B, 1, N)  # B S N
             # import ipdb; ipdb.set_trace()
+            # TODO: Best-of-N / worst-of-N here
             coords, viss, confs = self.forward_window(
                 fmaps_pyramid=(
                     fmaps_pyramid
