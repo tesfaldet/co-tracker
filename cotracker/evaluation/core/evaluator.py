@@ -467,9 +467,7 @@ def best_of_n(
                     traj_metrics["d_all_avg"], dim=1
                 ).indices.squeeze(0)  # [N]
         else:
-            avg_conf_pred = (
-                conf_pred[..., 0].sigmoid().mean(dim=1)[None]
-            )  # [1, num_samples, N]
+            avg_conf_pred = conf_pred.sigmoid().mean(dim=1)[None]  # [1, num_samples, N]
             if not worst_of_n:
                 best_sample_ind = torch.max(avg_conf_pred, dim=1).indices.squeeze(
                     0
